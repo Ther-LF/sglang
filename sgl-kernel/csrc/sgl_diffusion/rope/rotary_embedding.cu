@@ -26,11 +26,14 @@
  
  #include "utils.h"
  
+ // [Optimization Change 1]
+ // Modified device function to accept pointers that might be in Shared Memory.
+ // Removed SGLANG_LDG for cos_ptr/sin_ptr because __ldg is only for Global Memory.
  template <typename scalar_t, bool interleaved>
  inline __device__ void apply_token_rotary_embedding(
      scalar_t* __restrict__ arr,            // [head_size]
-     const scalar_t* __restrict__ cos_ptr,  // [rot_dim]
-     const scalar_t* __restrict__ sin_ptr,  // [rot_dim]
+     const scalar_t* __restrict__ cos_ptr,  // [rot_dim] (Points to SMEM now)
+     const scalar_t* __restrict__ sin_ptr,  // [rot_dim] (Points to SMEM now)
      int rot_offset,
      int embed_dim) {  // for non-interleaved: half dim
    if constexpr (interleaved) {
@@ -39,8 +42,9 @@
      const int x_index = 2 * rot_offset;
      const int y_index = x_index + 1;
  
-     const float cos_val = static_cast<float>(SGLANG_LDG(cos_ptr + rot_offset));
-     const float sin_val = static_cast<float>(SGLANG_LDG(sin_ptr + rot_offset));
+     // Directly access SMEM (no LDG)
+     const float cos_val = static_cast<float>(cos_ptr[rot_offset]);
+     const float sin_val = static_cast<float>(sin_ptr[rot_offset]);
  
      const float x = static_cast<float>(arr[x_index]);
      const float y = static_cast<float>(arr[y_index]);
@@ -52,10 +56,11 @@
      const int x_index = rot_offset;
      const int y_index = rot_offset + embed_dim;
  
-     const float cos_val_x = static_cast<float>(SGLANG_LDG(cos_ptr + rot_offset));
-     const float sin_val_x = static_cast<float>(SGLANG_LDG(sin_ptr + rot_offset));
-     const float cos_val_y = static_cast<float>(SGLANG_LDG(cos_ptr + rot_offset + embed_dim));
-     const float sin_val_y = static_cast<float>(SGLANG_LDG(sin_ptr + rot_offset + embed_dim));
+     // Directly access SMEM (no LDG)
+     const float cos_val_x = static_cast<float>(cos_ptr[rot_offset]);
+     const float sin_val_x = static_cast<float>(sin_ptr[rot_offset]);
+     const float cos_val_y = static_cast<float>(cos_ptr[rot_offset + embed_dim]);
+     const float sin_val_y = static_cast<float>(sin_ptr[rot_offset + embed_dim]);
  
      const float x = static_cast<float>(arr[x_index]);
      const float y = static_cast<float>(arr[y_index]);
@@ -64,6 +69,8 @@
    }
  }
  
+ // [Optimization Change 2]
+ // Specialized version also updated to remove SGLANG_LDG for cos/sin
  template <>
  inline __device__ void apply_token_rotary_embedding<float, true>(
      float* __restrict__ arr,
@@ -72,8 +79,10 @@
      int rot_offset,
      int /*embed_dim*/) {
    float2 xy = *reinterpret_cast<const float2*>(arr + rot_offset * 2);
-   const float cos_val = static_cast<float>(SGLANG_LDG(cos_ptr + rot_offset));
-   const float sin_val = static_cast<float>(SGLANG_LDG(sin_ptr + rot_offset));
+   
+   // Directly access SMEM
+   const float cos_val = static_cast<float>(cos_ptr[rot_offset]);
+   const float sin_val = static_cast<float>(sin_ptr[rot_offset]);
  
    float2 out;
    out.x = xy.x * cos_val - xy.y * sin_val;
@@ -99,13 +108,30 @@
      const int num_kv_heads,
      const int head_size,
      const int blocks_per_token) {
+   
+   // [Optimization Change 3] Shared Memory Declaration
+   extern __shared__ char smem_[];
+   scalar_t* s_cos = reinterpret_cast<scalar_t*>(smem_);
+   scalar_t* s_sin = s_cos + rot_dim_arg;
+ 
    const int token_idx = blockIdx.x;
    if (token_idx >= gridDim.x) {
      return;
    }
  
+   // Pointers to Global Memory for the current token
    const scalar_t* current_token_cos_ptr = cos_data + token_idx * rot_dim_arg;
    const scalar_t* current_token_sin_ptr = sin_data + token_idx * rot_dim_arg;
+ 
+   // [Optimization Change 4] Cooperative Load: Global Memory -> Shared Memory
+   // Each block loads its own copy of cos/sin for the current token into SMEM.
+   // Use SGLANG_LDG here for optimal Global Memory read.
+   for (int i = threadIdx.x; i < rot_dim_arg; i += blockDim.x) {
+     s_cos[i] = SGLANG_LDG(current_token_cos_ptr + i);
+     s_sin[i] = SGLANG_LDG(current_token_sin_ptr + i);
+   }
+   // Essential synchronization
+   __syncthreads();
  
    scalar_t* query_for_token = query_total + token_idx * (int)query_token_stride;
    scalar_t* key_for_token = (key_total != nullptr) ? (key_total + token_idx * (int)key_token_stride) : nullptr;
@@ -120,8 +146,9 @@
      const int rot_offset = i % embed_dim_for_rotation;
  
      scalar_t* query_for_token_head = query_for_token + head_idx * (int)head_stride_query;
+     // [Optimization Change 5] Pass Shared Memory pointers (s_cos, s_sin)
      apply_token_rotary_embedding<scalar_t, interleaved>(
-         query_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
+         query_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
    }
  
    if (key_for_token != nullptr) {
@@ -131,8 +158,9 @@
        const int rot_offset = i % embed_dim_for_rotation;
  
        scalar_t* key_for_token_head = key_for_token + head_idx * (int)head_stride_key;
+       // Pass Shared Memory pointers
        apply_token_rotary_embedding<scalar_t, interleaved>(
-           key_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
+           key_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
      }
    }
  }
@@ -153,11 +181,24 @@
      const int num_heads,
      const int num_kv_heads,
      const int head_size) {
+   
+   // [Optimization Change 3] Shared Memory Declaration
+   extern __shared__ char smem_[];
+   scalar_t* s_cos = reinterpret_cast<scalar_t*>(smem_);
+   scalar_t* s_sin = s_cos + rot_dim_arg;
+ 
    const int token_idx = blockIdx.x;
    if (token_idx >= gridDim.x) return;
  
    const scalar_t* current_token_cos_ptr = cos_data + token_idx * rot_dim_arg;
    const scalar_t* current_token_sin_ptr = sin_data + token_idx * rot_dim_arg;
+ 
+   // [Optimization Change 4] Cooperative Load: Global Memory -> Shared Memory
+   for (int i = threadIdx.x; i < rot_dim_arg; i += blockDim.x) {
+     s_cos[i] = SGLANG_LDG(current_token_cos_ptr + i);
+     s_sin[i] = SGLANG_LDG(current_token_sin_ptr + i);
+   }
+   __syncthreads();
  
    scalar_t* query_for_token = query_total + token_idx * (int)query_token_stride;
    scalar_t* key_for_token = (key_total != nullptr) ? (key_total + token_idx * (int)key_token_stride) : nullptr;
@@ -167,8 +208,10 @@
      const int head_idx = i / embed_dim_for_rotation;
      const int rot_offset = i % embed_dim_for_rotation;
      scalar_t* query_for_token_head = query_for_token + head_idx * (int)head_stride_query;
+     
+     // Pass Shared Memory pointers
      apply_token_rotary_embedding<scalar_t, interleaved>(
-         query_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
+         query_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
    }
  
    if (key_for_token != nullptr) {
@@ -176,9 +219,11 @@
      for (int i = threadIdx.x; i < nk_pairs; i += blockDim.x) {
        const int head_idx = i / embed_dim_for_rotation;
        const int rot_offset = i % embed_dim_for_rotation;
+       
        scalar_t* key_for_token_head = key_for_token + head_idx * (int)head_stride_key;
+       // Pass Shared Memory pointers
        apply_token_rotary_embedding<scalar_t, interleaved>(
-           key_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
+           key_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
      }
    }
  }
@@ -297,10 +342,14 @@
              nv_half,
              typename std::conditional<std::is_same<torch_scalar_t, at::BFloat16>::value, nv_bfloat16, torch_scalar_t>::
                  type>::type;
+         
+         // [Optimization Change 6] Calculate required shared memory size
+         // We need 2 arrays (cos, sin) of size 'rot_dim_from_cache', each element is 'sizeof(torch_scalar_t)'
+         size_t smem_size = rot_dim_from_cache * sizeof(torch_scalar_t) * 2;
  
          if (interleaved) {
            if (use_grid_2d) {
-             rotary_embedding_kernel_2d<cuda_scalar_t, true><<<grid_2d, block, 0, stream>>>(
+             rotary_embedding_kernel_2d<cuda_scalar_t, true><<<grid_2d, block, smem_size, stream>>>(
                  reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
                  reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
                  reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
@@ -316,7 +365,7 @@
                  (int)head_size,
                  blocks_per_token);
            } else {
-             rotary_embedding_kernel_1d<cuda_scalar_t, true><<<grid_1d, block, 0, stream>>>(
+             rotary_embedding_kernel_1d<cuda_scalar_t, true><<<grid_1d, block, smem_size, stream>>>(
                  reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
                  reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
                  reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
@@ -333,7 +382,7 @@
            }
          } else {
            if (use_grid_2d) {
-             rotary_embedding_kernel_2d<cuda_scalar_t, false><<<grid_2d, block, 0, stream>>>(
+             rotary_embedding_kernel_2d<cuda_scalar_t, false><<<grid_2d, block, smem_size, stream>>>(
                  reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
                  reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
                  reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
@@ -349,7 +398,7 @@
                  (int)head_size,
                  blocks_per_token);
            } else {
-             rotary_embedding_kernel_1d<cuda_scalar_t, false><<<grid_1d, block, 0, stream>>>(
+             rotary_embedding_kernel_1d<cuda_scalar_t, false><<<grid_1d, block, smem_size, stream>>>(
                  reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
                  reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
                  reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
