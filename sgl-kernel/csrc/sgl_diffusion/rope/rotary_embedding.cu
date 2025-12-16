@@ -26,14 +26,11 @@
  
  #include "utils.h"
  
- // [Optimization Change 1]
- // Modified device function to accept pointers that might be in Shared Memory.
- // Removed SGLANG_LDG for cos_ptr/sin_ptr because __ldg is only for Global Memory.
  template <typename scalar_t, bool interleaved>
  inline __device__ void apply_token_rotary_embedding(
      scalar_t* __restrict__ arr,            // [head_size]
-     const scalar_t* __restrict__ cos_ptr,  // [rot_dim] (Points to SMEM now)
-     const scalar_t* __restrict__ sin_ptr,  // [rot_dim] (Points to SMEM now)
+     const scalar_t* __restrict__ cos_ptr,  // [rot_dim]
+     const scalar_t* __restrict__ sin_ptr,  // [rot_dim]
      int rot_offset,
      int embed_dim) {  // for non-interleaved: half dim
    if constexpr (interleaved) {
@@ -42,7 +39,7 @@
      const int x_index = 2 * rot_offset;
      const int y_index = x_index + 1;
  
-     // Directly access SMEM (no LDG)
+     // Directly access SMEM
      const float cos_val = static_cast<float>(cos_ptr[rot_offset]);
      const float sin_val = static_cast<float>(sin_ptr[rot_offset]);
  
@@ -56,7 +53,7 @@
      const int x_index = rot_offset;
      const int y_index = rot_offset + embed_dim;
  
-     // Directly access SMEM (no LDG)
+     // Directly access SMEM
      const float cos_val_x = static_cast<float>(cos_ptr[rot_offset]);
      const float sin_val_x = static_cast<float>(sin_ptr[rot_offset]);
      const float cos_val_y = static_cast<float>(cos_ptr[rot_offset + embed_dim]);
@@ -69,8 +66,6 @@
    }
  }
  
- // [Optimization Change 2]
- // Specialized version also updated to remove SGLANG_LDG for cos/sin
  template <>
  inline __device__ void apply_token_rotary_embedding<float, true>(
      float* __restrict__ arr,
@@ -109,7 +104,6 @@
      const int head_size,
      const int blocks_per_token) {
    
-   // [Optimization Change 3] Shared Memory Declaration
    extern __shared__ char smem_[];
    scalar_t* s_cos = reinterpret_cast<scalar_t*>(smem_);
    scalar_t* s_sin = s_cos + rot_dim_arg;
@@ -120,16 +114,34 @@
    }
  
    // Pointers to Global Memory for the current token
-   const scalar_t* current_token_cos_ptr = cos_data + token_idx * rot_dim_arg;
-   const scalar_t* current_token_sin_ptr = sin_data + token_idx * rot_dim_arg;
- 
-   // [Optimization Change 4] Cooperative Load: Global Memory -> Shared Memory
-   // Each block loads its own copy of cos/sin for the current token into SMEM.
-   // Use SGLANG_LDG here for optimal Global Memory read.
-   for (int i = threadIdx.x; i < rot_dim_arg; i += blockDim.x) {
-     s_cos[i] = SGLANG_LDG(current_token_cos_ptr + i);
-     s_sin[i] = SGLANG_LDG(current_token_sin_ptr + i);
-   }
+  const scalar_t* current_token_cos_ptr = cos_data + token_idx * rot_dim_arg;
+  const scalar_t* current_token_sin_ptr = sin_data + token_idx * rot_dim_arg;
+
+  constexpr int kVecBytes = 16;
+  const int scalar_size = sizeof(scalar_t);
+  const int vec_size = kVecBytes / scalar_size;
+
+  bool is_aligned = (rot_dim_arg % vec_size == 0) &&
+                    (reinterpret_cast<uintptr_t>(current_token_cos_ptr) % kVecBytes == 0) &&
+                    (reinterpret_cast<uintptr_t>(current_token_sin_ptr) % kVecBytes == 0);
+
+  if (is_aligned) {
+    using vec_t = float4;
+    const vec_t* cos_vec_ptr = reinterpret_cast<const vec_t*>(current_token_cos_ptr);
+    const vec_t* sin_vec_ptr = reinterpret_cast<const vec_t*>(current_token_sin_ptr);
+    vec_t* s_cos_vec = reinterpret_cast<vec_t*>(s_cos);
+    vec_t* s_sin_vec = reinterpret_cast<vec_t*>(s_sin);
+
+    for (int i = threadIdx.x; i < rot_dim_arg / vec_size; i += blockDim.x) {
+      s_cos_vec[i] = __ldg(cos_vec_ptr + i);
+      s_sin_vec[i] = __ldg(sin_vec_ptr + i);
+    }
+  } else {
+    for (int i = threadIdx.x; i < rot_dim_arg; i += blockDim.x) {
+      s_cos[i] = SGLANG_LDG(current_token_cos_ptr + i);
+      s_sin[i] = SGLANG_LDG(current_token_sin_ptr + i);
+    }
+  }
    // Essential synchronization
    __syncthreads();
  
@@ -146,7 +158,6 @@
      const int rot_offset = i % embed_dim_for_rotation;
  
      scalar_t* query_for_token_head = query_for_token + head_idx * (int)head_stride_query;
-     // [Optimization Change 5] Pass Shared Memory pointers (s_cos, s_sin)
      apply_token_rotary_embedding<scalar_t, interleaved>(
          query_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
    }
@@ -182,7 +193,6 @@
      const int num_kv_heads,
      const int head_size) {
    
-   // [Optimization Change 3] Shared Memory Declaration
    extern __shared__ char smem_[];
    scalar_t* s_cos = reinterpret_cast<scalar_t*>(smem_);
    scalar_t* s_sin = s_cos + rot_dim_arg;
@@ -190,14 +200,34 @@
    const int token_idx = blockIdx.x;
    if (token_idx >= gridDim.x) return;
  
-   const scalar_t* current_token_cos_ptr = cos_data + token_idx * rot_dim_arg;
-   const scalar_t* current_token_sin_ptr = sin_data + token_idx * rot_dim_arg;
- 
-   // [Optimization Change 4] Cooperative Load: Global Memory -> Shared Memory
-   for (int i = threadIdx.x; i < rot_dim_arg; i += blockDim.x) {
-     s_cos[i] = SGLANG_LDG(current_token_cos_ptr + i);
-     s_sin[i] = SGLANG_LDG(current_token_sin_ptr + i);
-   }
+  const scalar_t* current_token_cos_ptr = cos_data + token_idx * rot_dim_arg;
+  const scalar_t* current_token_sin_ptr = sin_data + token_idx * rot_dim_arg;
+
+  constexpr int kVecBytes = 16;
+  const int scalar_size = sizeof(scalar_t);
+  const int vec_size = kVecBytes / scalar_size;
+
+  bool is_aligned = (rot_dim_arg % vec_size == 0) &&
+                    (reinterpret_cast<uintptr_t>(current_token_cos_ptr) % kVecBytes == 0) &&
+                    (reinterpret_cast<uintptr_t>(current_token_sin_ptr) % kVecBytes == 0);
+
+  if (is_aligned) {
+    using vec_t = float4;
+    const vec_t* cos_vec_ptr = reinterpret_cast<const vec_t*>(current_token_cos_ptr);
+    const vec_t* sin_vec_ptr = reinterpret_cast<const vec_t*>(current_token_sin_ptr);
+    vec_t* s_cos_vec = reinterpret_cast<vec_t*>(s_cos);
+    vec_t* s_sin_vec = reinterpret_cast<vec_t*>(s_sin);
+
+    for (int i = threadIdx.x; i < rot_dim_arg / vec_size; i += blockDim.x) {
+      s_cos_vec[i] = __ldg(cos_vec_ptr + i);
+      s_sin_vec[i] = __ldg(sin_vec_ptr + i);
+    }
+  } else {
+    for (int i = threadIdx.x; i < rot_dim_arg; i += blockDim.x) {
+      s_cos[i] = SGLANG_LDG(current_token_cos_ptr + i);
+      s_sin[i] = SGLANG_LDG(current_token_sin_ptr + i);
+    }
+  }
    __syncthreads();
  
    scalar_t* query_for_token = query_total + token_idx * (int)query_token_stride;
@@ -208,8 +238,7 @@
      const int head_idx = i / embed_dim_for_rotation;
      const int rot_offset = i % embed_dim_for_rotation;
      scalar_t* query_for_token_head = query_for_token + head_idx * (int)head_stride_query;
-     
-     // Pass Shared Memory pointers
+      
      apply_token_rotary_embedding<scalar_t, interleaved>(
          query_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
    }
@@ -221,7 +250,6 @@
        const int rot_offset = i % embed_dim_for_rotation;
        
        scalar_t* key_for_token_head = key_for_token + head_idx * (int)head_stride_key;
-       // Pass Shared Memory pointers
        apply_token_rotary_embedding<scalar_t, interleaved>(
            key_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
      }
@@ -343,7 +371,6 @@
              typename std::conditional<std::is_same<torch_scalar_t, at::BFloat16>::value, nv_bfloat16, torch_scalar_t>::
                  type>::type;
          
-         // [Optimization Change 6] Calculate required shared memory size
          // We need 2 arrays (cos, sin) of size 'rot_dim_from_cache', each element is 'sizeof(torch_scalar_t)'
          size_t smem_size = rot_dim_from_cache * sizeof(torch_scalar_t) * 2;
  
