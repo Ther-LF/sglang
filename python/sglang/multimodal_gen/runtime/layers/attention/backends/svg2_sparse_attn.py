@@ -633,6 +633,56 @@ def _gather_kv_triton(k: torch.Tensor, v: torch.Tensor, indices: torch.Tensor) -
     return k_out, v_out
 
 
+def _expand_block_mask_to_token_mask(
+    block_mask: torch.Tensor,      # [B, H, Kq, Kk]
+    q_cluster_sizes: torch.Tensor,  # [B, H, Kq]
+    k_cluster_sizes: torch.Tensor,  # [B, H, Kk]
+    S: int,
+) -> torch.Tensor:
+    """
+    Expand block-level mask to token-level mask.
+    
+    Vectorized implementation - no Python loops.
+    Uses broadcasting and repeat_interleave for efficiency.
+    """
+    B, H, Kq, Kk = block_mask.shape
+    device = block_mask.device
+    
+    # Flatten B, H dimensions for vectorized processing
+    block_mask_flat = block_mask.reshape(B * H, Kq, Kk)  # [BH, Kq, Kk]
+    q_sizes_flat = q_cluster_sizes.reshape(B * H, Kq).to(torch.int64)  # [BH, Kq]
+    k_sizes_flat = k_cluster_sizes.reshape(B * H, Kk).to(torch.int64)  # [BH, Kk]
+    
+    # Create output tensor
+    token_mask = torch.zeros(B * H, S, S, dtype=torch.bool, device=device)
+    
+    # Process in a vectorized manner by creating index mappings
+    # For each position in S, determine which block it belongs to
+    
+    # Create block indices for Q and K
+    q_block_starts = torch.zeros(B * H, Kq + 1, dtype=torch.int64, device=device)
+    k_block_starts = torch.zeros(B * H, Kk + 1, dtype=torch.int64, device=device)
+    q_block_starts[:, 1:] = q_sizes_flat.cumsum(dim=-1)
+    k_block_starts[:, 1:] = k_sizes_flat.cumsum(dim=-1)
+    
+    # For each (b*h), expand the mask
+    # This is still a loop but over BH which is typically small (1-32)
+    for bh in range(B * H):
+        q_sizes = q_sizes_flat[bh]
+        k_sizes = k_sizes_flat[bh]
+        mask = block_mask_flat[bh]  # [Kq, Kk]
+        
+        # Expand: repeat each row q_sizes[qi] times, each col k_sizes[ki] times
+        # Step 1: expand columns
+        expanded_k = mask.repeat_interleave(k_sizes, dim=1)  # [Kq, S]
+        # Step 2: expand rows  
+        expanded_qk = expanded_k.repeat_interleave(q_sizes, dim=0)  # [S, S]
+        
+        token_mask[bh] = expanded_qk
+    
+    return token_mask.reshape(B, H, S, S)
+
+
 def block_sparse_attention(
     q: torch.Tensor,           # [B, H, S, D]
     k: torch.Tensor,           # [B, H, S, D]
@@ -642,78 +692,76 @@ def block_sparse_attention(
     k_cluster_sizes: torch.Tensor,  # [B, H, Kk]
 ) -> torch.Tensor:
     """
-    Block sparse attention with variable block sizes using Triton.
+    Block sparse attention with variable block sizes.
     
-    After permutation, tokens are grouped by clusters.
-    This function computes attention only for masked block pairs.
-    
-    Uses Triton kernels for:
-    1. Gathering attended K, V blocks
-    2. Flash attention computation
+    Uses masked attention for efficiency - no Python loops over blocks.
+    The block mask is expanded to token-level mask and applied to attention.
     """
     B, H, S, D = q.shape
-    Kq = block_mask.shape[2]
-    Kk = block_mask.shape[3]
+    device = q.device
+    dtype = q.dtype
+    scale = 1.0 / math.sqrt(D)
+    
+    # Expand block mask to token-level mask
+    token_mask = _expand_block_mask_to_token_mask(
+        block_mask, q_cluster_sizes, k_cluster_sizes, S
+    )  # [B, H, S, S]
+    
+    # Compute attention with mask using PyTorch's efficient SDPA
+    # Convert mask: True means attend, False means mask out
+    # SDPA expects: True = masked out (don't attend), so we invert
+    attn_mask = ~token_mask  # [B, H, S, S]
+    
+    # Use scaled_dot_product_attention with mask
+    # Note: attn_mask should be float for additive mask or bool for masking
+    attn_mask_float = torch.where(attn_mask, float('-inf'), 0.0).to(dtype)
+    
+    # Compute Q @ K^T * scale + mask
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, H, S, S]
+    scores = scores + attn_mask_float
+    
+    # Softmax and apply to V
+    attn_weights = torch.softmax(scores, dim=-1)
+    # Handle all-masked rows (will be nan from softmax)
+    attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+    
+    output = torch.matmul(attn_weights, v)  # [B, H, S, D]
+    
+    return output
+
+
+def block_sparse_attention_v2(
+    q: torch.Tensor,           # [B, H, S, D]
+    k: torch.Tensor,           # [B, H, S, D]
+    v: torch.Tensor,           # [B, H, S, D]
+    block_mask: torch.Tensor,  # [B, H, Kq, Kk]
+    q_cluster_sizes: torch.Tensor,  # [B, H, Kq]
+    k_cluster_sizes: torch.Tensor,  # [B, H, Kk]
+) -> torch.Tensor:
+    """
+    Block sparse attention using PyTorch's SDPA (most efficient for modern GPUs).
+    
+    Uses F.scaled_dot_product_attention with custom mask.
+    """
+    B, H, S, D = q.shape
     device = q.device
     dtype = q.dtype
     
-    output = torch.zeros_like(q)
-    scale = 1.0 / math.sqrt(D)
+    # Expand block mask to token-level mask
+    token_mask = _expand_block_mask_to_token_mask(
+        block_mask, q_cluster_sizes, k_cluster_sizes, S
+    )  # [B, H, S, S]
     
-    # Process each batch and head
-    for b in range(B):
-        # Compute cumulative block sizes
-        q_cumsum = torch.cat([
-            torch.zeros(H, 1, dtype=torch.int32, device=device),
-            q_cluster_sizes[b].cumsum(dim=-1).to(torch.int32)
-        ], dim=-1)  # [H, Kq+1]
-        
-        k_cumsum = torch.cat([
-            torch.zeros(H, 1, dtype=torch.int32, device=device),
-            k_cluster_sizes[b].cumsum(dim=-1).to(torch.int32)
-        ], dim=-1)  # [H, Kk+1]
-        
-        for h in range(H):
-            # Get tensors for this head
-            q_h = q[b, h].contiguous()  # [S, D]
-            k_h = k[b, h].contiguous()  # [S, D]
-            v_h = v[b, h].contiguous()  # [S, D]
-            mask_h = block_mask[b, h]   # [Kq, Kk]
-            
-            q_starts = q_cumsum[h]
-            k_starts = k_cumsum[h]
-            
-            # For each query block
-            for qi in range(Kq):
-                qs = q_starts[qi].item()
-                qe = q_starts[qi + 1].item()
-                if qe <= qs:
-                    continue
-                
-                q_block = q_h[qs:qe].contiguous()  # [block_size_q, D]
-                
-                # Collect indices of all attended K tokens
-                attended_indices = []
-                for ki in range(Kk):
-                    if mask_h[qi, ki] == 0:
-                        continue
-                    ks = k_starts[ki].item()
-                    ke = k_starts[ki + 1].item()
-                    if ke <= ks:
-                        continue
-                    attended_indices.append(torch.arange(ks, ke, device=device))
-                
-                if len(attended_indices) == 0:
-                    continue
-                
-                # Gather K, V using Triton
-                indices = torch.cat(attended_indices)
-                k_gathered, v_gathered = _gather_kv_triton(k_h, v_h, indices)
-                
-                # Compute attention using Triton Flash Attention
-                out_block = _triton_flash_attn(q_block, k_gathered, v_gathered, scale)
-                
-                output[b, h, qs:qe] = out_block.to(dtype)
+    # SDPA uses additive mask (0 = attend, -inf = mask)
+    attn_mask = torch.where(token_mask, 0.0, float('-inf')).to(dtype)
+    
+    # Use PyTorch's optimized SDPA
+    output = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v,
+        attn_mask=attn_mask,
+        dropout_p=0.0,
+        scale=1.0 / math.sqrt(D),
+    )
     
     return output
 
@@ -883,6 +931,14 @@ class SVG2SparseAttentionBackend(AttentionBackend):
 class SVG2SparseAttentionImpl(AttentionImpl):
     """Implementation of SVG2 Sparse Attention."""
     
+    # Default SVG2 parameters (matching original SVG implementation)
+    DEFAULT_NUM_Q_CLUSTERS = 64
+    DEFAULT_NUM_K_CLUSTERS = 64
+    DEFAULT_TOP_P = 0.5
+    DEFAULT_KMEANS_ITERS = 5
+    DEFAULT_FIRST_LAYERS_FP = 0  # Number of first layers using full attention
+    DEFAULT_FIRST_TIMES_FP = 0   # Timestep threshold (timesteps > this use full attention)
+    
     def __init__(
         self,
         num_heads: int,
@@ -891,6 +947,13 @@ class SVG2SparseAttentionImpl(AttentionImpl):
         causal: bool = False,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        # SVG2 specific parameters
+        num_q_clusters: int = 64,
+        num_k_clusters: int = 64,
+        top_p: float = 0.5,
+        kmeans_iters: int = 5,
+        first_layers_fp: int = 0,
+        first_times_fp: float = 0,
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
@@ -900,33 +963,126 @@ class SVG2SparseAttentionImpl(AttentionImpl):
         self.num_kv_heads = num_kv_heads or num_heads
         self.prefix = prefix
         
-        # Centroid cache for iterative refinement
+        # SVG2 parameters
+        self.num_q_clusters = num_q_clusters
+        self.num_k_clusters = num_k_clusters
+        self.top_p = top_p
+        self.kmeans_iters = kmeans_iters
+        self.first_layers_fp = first_layers_fp
+        self.first_times_fp = first_times_fp
+        
+        # Centroid cache for iterative refinement across timesteps
         self.q_centroids = None
         self.k_centroids = None
+        self.centroids_initialized = False
+        
+        # Extract layer index from prefix if available
+        self.layer_idx = self._extract_layer_idx(prefix)
+    
+    def _extract_layer_idx(self, prefix: str) -> int:
+        """Extract layer index from prefix string like 'blocks.5.attn1'."""
+        import re
+        match = re.search(r'blocks\.(\d+)', prefix)
+        if match:
+            return int(match.group(1))
+        return 0
+    
+    def _should_use_full_attention(
+        self,
+        timestep: Optional[float] = None,
+    ) -> bool:
+        """
+        Determine if full attention should be used based on layer/timestep.
+        
+        Matching original SVG logic:
+        - if layer_idx < first_layers_fp: use full attention
+        - if timestep > first_times_fp: use full attention
+        
+        Note: timestep decreases from ~1000 to 0 during inference,
+        so timestep > threshold means early inference steps.
+        """
+        # First N layers always use full attention
+        if self.layer_idx < self.first_layers_fp:
+            return True
+        
+        # Early timesteps (high values) use full attention
+        if timestep is not None and timestep > self.first_times_fp:
+            return True
+        
+        return False
     
     def forward(
         self,
         query: torch.Tensor,  # [B, S, H, D]
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: SVG2SparseAttentionMetadata,
+        attn_metadata: Optional[SVG2SparseAttentionMetadata] = None,
     ) -> torch.Tensor:
-        """Forward pass for SVG2 sparse attention."""
+        """
+        Forward pass for SVG2 sparse attention.
         
-        # Use cached centroids if available
-        init_q_centroids = self.q_centroids
-        init_k_centroids = self.k_centroids
+        Args:
+            query: [B, S, H, D] query tensor
+            key: [B, S, H, D] key tensor  
+            value: [B, S, H, D] value tensor
+            attn_metadata: Optional metadata with SVG2 parameters
         
-        # Run SVG2 attention
+        Returns:
+            output: [B, S, H, D] attention output
+        """
+        # Get parameters from metadata or use defaults
+        if attn_metadata is not None:
+            num_q_clusters = getattr(attn_metadata, 'num_q_clusters', self.num_q_clusters)
+            num_k_clusters = getattr(attn_metadata, 'num_k_clusters', self.num_k_clusters)
+            top_p = getattr(attn_metadata, 'top_p', self.top_p)
+            kmeans_iters = getattr(attn_metadata, 'kmeans_iters', self.kmeans_iters)
+            # Get timestep for full attention decision
+            timestep = getattr(attn_metadata, 'current_timestep', None)
+        else:
+            num_q_clusters = self.num_q_clusters
+            num_k_clusters = self.num_k_clusters
+            top_p = self.top_p
+            kmeans_iters = self.kmeans_iters
+            timestep = None
+        
+        # Check if we should use full attention (early layers or early timesteps)
+        if self._should_use_full_attention(timestep):
+            # Use standard scaled dot-product attention
+            return self._full_attention(query, key, value)
+        
+        # Use SVG2 sparse attention
         output = svg2_attention_forward(
             query, key, value,
-            num_q_clusters=attn_metadata.num_q_clusters,
-            num_k_clusters=attn_metadata.num_k_clusters,
-            top_p=attn_metadata.top_p,
-            kmeans_iters=attn_metadata.kmeans_iters,
+            num_q_clusters=num_q_clusters,
+            num_k_clusters=num_k_clusters,
+            top_p=top_p,
+            kmeans_iters=kmeans_iters,
         )
         
         return output
+    
+    def _full_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        """Standard full attention using PyTorch SDPA."""
+        # Input shape: [B, S, H, D]
+        # SDPA expects: [B, H, S, D]
+        q = query.transpose(1, 2)
+        k = key.transpose(1, 2)
+        v = value.transpose(1, 2)
+        
+        output = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=0.0,
+            is_causal=self.causal,
+            scale=self.softmax_scale,
+        )
+        
+        # Transpose back to [B, S, H, D]
+        return output.transpose(1, 2)
 
 
 

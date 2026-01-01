@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.layers.attention.layer import (
     UlyssesAttention,
     UlyssesAttention_VSA,
     USPAttention,
+    USPAttention_SVG2,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
@@ -21,6 +22,7 @@ from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
 
 __all__ = [
     "USPAttention",
+    "USPAttention_SVG2",
     "LocalAttention",
     "UlyssesAttention",
     "UlyssesAttention_VSA",

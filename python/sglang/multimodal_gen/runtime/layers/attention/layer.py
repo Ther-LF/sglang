@@ -391,3 +391,121 @@ class USPAttention(nn.Module):
             out = _usp_output_all_to_all(out, head_dim=2)
 
         return out
+
+
+class USPAttention_SVG2(nn.Module):
+    """
+    Ulysses Sequence Parallelism with SVG2 Sparse Attention.
+    
+    This class combines USP communication patterns with SVG2's semantic-aware
+    sparse attention for efficient video generation.
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        num_kv_heads: int | None = None,
+        softmax_scale: float | None = None,
+        causal: bool = False,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        prefix: str = "",
+        dropout_rate: float = 0.0,
+        # SVG2 specific parameters
+        num_q_clusters: int = 64,
+        num_k_clusters: int = 64,
+        top_p: float = 0.5,
+        kmeans_iters: int = 5,
+        first_layers_fp: int = 0,
+        first_times_fp: float = 0,
+        **extra_impl_args,
+    ) -> None:
+        super().__init__()
+        if softmax_scale is None:
+            self.softmax_scale = head_size**-0.5
+        else:
+            self.softmax_scale = softmax_scale
+
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+
+        # Force use SVG2 backend
+        from sglang.multimodal_gen.runtime.layers.attention.backends.svg2_sparse_attn import (
+            SVG2SparseAttentionImpl,
+        )
+        
+        self.attn_impl = SVG2SparseAttentionImpl(
+            num_heads=num_heads,
+            head_size=head_size,
+            causal=causal,
+            softmax_scale=self.softmax_scale,
+            num_kv_heads=num_kv_heads,
+            prefix=prefix,
+            num_q_clusters=num_q_clusters,
+            num_k_clusters=num_k_clusters,
+            top_p=top_p,
+            kmeans_iters=kmeans_iters,
+            first_layers_fp=first_layers_fp,
+            first_times_fp=first_times_fp,
+            **extra_impl_args,
+        )
+        
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.num_kv_heads = num_kv_heads
+        self.backend = AttentionBackendEnum.SVG2_SPARSE_ATTN
+        self.dtype = get_compute_dtype()
+        self.causal = causal
+        self.dropout_p = dropout_rate
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        replicated_q: torch.Tensor | None = None,
+        replicated_k: torch.Tensor | None = None,
+        replicated_v: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass for USPAttention_SVG2.
+
+        Args:
+            q, k, v: [B, S_local, H, D]
+
+        Note: Replicated tensors are not supported in this implementation.
+        """
+        assert (
+            replicated_q is None and replicated_k is None and replicated_v is None
+        ), "USPAttention_SVG2 does not support replicated_qkv."
+        
+        forward_context: ForwardContext = get_forward_context()
+        ctx_attn_metadata = forward_context.attn_metadata
+        
+        if get_sequence_parallel_world_size() == 1:
+            # No sequence parallelism, just run local attention.
+            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            return out
+
+        # Ulysses-style All-to-All for sequence/head sharding
+        if get_ulysses_parallel_world_size() > 1:
+            # -> [B, S, H_local, D]
+            q = _usp_input_all_to_all(q, head_dim=2)
+            k = _usp_input_all_to_all(k, head_dim=2)
+            v = _usp_input_all_to_all(v, head_dim=2)
+
+        # Ring Attention is not supported with SVG2, use local attention
+        if get_ring_parallel_world_size() > 1:
+            # For SVG2, we don't support ring attention yet
+            # Fall back to local SVG2 attention
+            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+        else:
+            # -> [B, S, H_local, D]
+            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+
+        # Ulysses-style All-to-All to restore original sharding
+        if get_ulysses_parallel_world_size() > 1:
+            # -> [B, S_local, H, D]
+            out = _usp_output_all_to_all(out, head_dim=2)
+
+        return out

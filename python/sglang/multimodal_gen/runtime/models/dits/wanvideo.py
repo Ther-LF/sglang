@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     SparseLinearAttention,
     UlyssesAttention_VSA,
     USPAttention,
+    USPAttention_SVG2,
 )
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
@@ -603,6 +604,206 @@ class WanTransformerBlock_VSA(nn.Module):
         return hidden_states
 
 
+class WanTransformerBlock_SVG2(nn.Module):
+    """
+    WAN Transformer Block with SVG2 (Semantic-Aware Sparse) Attention.
+    
+    Uses SVG2's K-Means clustering and dynamic block sparse attention
+    for efficient video generation.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        ffn_dim: int,
+        num_heads: int,
+        qk_norm: str = "rms_norm_across_heads",
+        cross_attn_norm: bool = False,
+        eps: float = 1e-6,
+        added_kv_proj_dim: int | None = None,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        prefix: str = "",
+        # SVG2 specific parameters
+        num_q_clusters: int = 64,
+        num_k_clusters: int = 64,
+        top_p: float = 0.5,
+        kmeans_iters: int = 5,
+        first_layers_fp: int = 0,
+        first_times_fp: float = 0,
+        **kwargs,
+    ):
+        super().__init__()
+
+        # 1. Self-attention with SVG2
+        self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
+        self.to_q = ReplicatedLinear(dim, dim, bias=True)
+        self.to_k = ReplicatedLinear(dim, dim, bias=True)
+        self.to_v = ReplicatedLinear(dim, dim, bias=True)
+
+        self.to_out = ReplicatedLinear(dim, dim, bias=True)
+        
+        # Use SVG2 attention
+        self.attn1 = USPAttention_SVG2(
+            num_heads=num_heads,
+            head_size=dim // num_heads,
+            causal=False,
+            prefix=f"{prefix}.attn1",
+            num_q_clusters=num_q_clusters,
+            num_k_clusters=num_k_clusters,
+            top_p=top_p,
+            kmeans_iters=kmeans_iters,
+            first_layers_fp=first_layers_fp,
+            first_times_fp=first_times_fp,
+        )
+
+        self.hidden_dim = dim
+        self.num_attention_heads = num_heads
+        dim_head = dim // num_heads
+        if qk_norm == "rms_norm":
+            self.norm_q = RMSNorm(dim_head, eps=eps)
+            self.norm_k = RMSNorm(dim_head, eps=eps)
+        elif qk_norm == "rms_norm_across_heads":
+            self.norm_q = RMSNorm(dim, eps=eps)
+            self.norm_k = RMSNorm(dim, eps=eps)
+        else:
+            logger.error("QK Norm type not supported")
+            raise Exception
+        assert cross_attn_norm is True
+        self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+            dim,
+            norm_type="layer",
+            eps=eps,
+            elementwise_affine=True,
+            dtype=torch.float32,
+            compute_dtype=torch.float32,
+        )
+
+        # Remove SVG2 from cross-attention backends (use standard attention)
+        cross_attn_backends = supported_attention_backends.copy() if supported_attention_backends else set()
+        if AttentionBackendEnum.SVG2_SPARSE_ATTN in cross_attn_backends:
+            cross_attn_backends.remove(AttentionBackendEnum.SVG2_SPARSE_ATTN)
+        
+        # 2. Cross-attention (standard, not sparse)
+        if added_kv_proj_dim is not None:
+            self.attn2 = WanI2VCrossAttention(
+                dim,
+                num_heads,
+                qk_norm=qk_norm,
+                eps=eps,
+                supported_attention_backends=cross_attn_backends,
+            )
+        else:
+            self.attn2 = WanT2VCrossAttention(
+                dim,
+                num_heads,
+                qk_norm=qk_norm,
+                eps=eps,
+                supported_attention_backends=cross_attn_backends,
+            )
+        self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+            dim,
+            norm_type="layer",
+            eps=eps,
+            elementwise_affine=False,
+            dtype=torch.float32,
+            compute_dtype=torch.float32,
+        )
+
+        # 3. Feed-forward
+        self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
+        self.mlp_residual = ScaleResidual()
+
+        self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        if hidden_states.dim() == 4:
+            hidden_states = hidden_states.squeeze(1)
+        bs, seq_length, _ = hidden_states.shape
+        orig_dtype = hidden_states.dtype
+        
+        if temb.dim() == 4:
+            # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
+            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                self.scale_shift_table.unsqueeze(0) + temb.float()
+            ).chunk(6, dim=2)
+            shift_msa = shift_msa.squeeze(2)
+            scale_msa = scale_msa.squeeze(2)
+            gate_msa = gate_msa.squeeze(2)
+            c_shift_msa = c_shift_msa.squeeze(2)
+            c_scale_msa = c_scale_msa.squeeze(2)
+            c_gate_msa = c_gate_msa.squeeze(2)
+        else:
+            # temb: batch_size, 6, inner_dim (wan2.1/wan2.2 14B)
+            e = self.scale_shift_table + temb.float()
+            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                e.chunk(6, dim=1)
+            )
+
+        assert shift_msa.dtype == torch.float32
+
+        # 1. Self-attention with SVG2
+        norm1 = self.norm1(hidden_states.float())
+        norm_hidden_states = (norm1 * (1 + scale_msa) + shift_msa).to(orig_dtype)
+        query, _ = self.to_q(norm_hidden_states)
+        key, _ = self.to_k(norm_hidden_states)
+        value, _ = self.to_v(norm_hidden_states)
+
+        if self.norm_q is not None:
+            query = self.norm_q(query)
+        if self.norm_k is not None:
+            key = self.norm_k(key)
+
+        query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+
+        # Apply rotary embeddings
+        cos, sin = freqs_cis
+        query, key = _apply_rotary_emb(
+            query, cos, sin, is_neox_style=False
+        ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        
+        # SVG2 attention
+        attn_output = self.attn1(query, key, value)
+        attn_output = attn_output.flatten(2)
+        attn_output, _ = self.to_out(attn_output)
+        attn_output = attn_output.squeeze(1)
+
+        null_shift = null_scale = torch.zeros(
+            (1,), device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        norm_hidden_states, hidden_states = self.self_attn_residual_norm(
+            hidden_states, attn_output, gate_msa, null_shift, null_scale
+        )
+        norm_hidden_states, hidden_states = norm_hidden_states.to(
+            orig_dtype
+        ), hidden_states.to(orig_dtype)
+
+        # 2. Cross-attention
+        attn_output = self.attn2(
+            norm_hidden_states, context=encoder_hidden_states, context_lens=None
+        )
+        norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
+            hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
+        )
+        norm_hidden_states, hidden_states = norm_hidden_states.to(
+            orig_dtype
+        ), hidden_states.to(orig_dtype)
+
+        # 3. Feed-forward
+        ff_output = self.ffn(norm_hidden_states)
+        hidden_states = self.mlp_residual(hidden_states, ff_output, c_gate_msa)
+        hidden_states = hidden_states.to(orig_dtype)
+
+        return hidden_states
+
+
 class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
     _compile_conditions = WanVideoConfig()._compile_conditions
@@ -641,11 +842,18 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         # 3. Transformer blocks
         attn_backend = get_global_server_args().attention_backend
-        transformer_block = (
-            WanTransformerBlock_VSA
-            if (attn_backend and attn_backend.lower() == "video_sparse_attn")
-            else WanTransformerBlock
-        )
+        attn_backend_lower = attn_backend.lower() if attn_backend else None
+        
+        if attn_backend_lower == "video_sparse_attn":
+            transformer_block = WanTransformerBlock_VSA
+            logger.info("Using WanTransformerBlock_VSA (Video Sparse Attention)")
+        elif attn_backend_lower == "svg2_sparse_attn":
+            transformer_block = WanTransformerBlock_SVG2
+            logger.info("Using WanTransformerBlock_SVG2 (SVG2 Semantic-Aware Sparse Attention)")
+        else:
+            transformer_block = WanTransformerBlock
+            logger.info(f"Using WanTransformerBlock (backend: {attn_backend or 'default'})")
+        
         self.blocks = nn.ModuleList(
             [
                 transformer_block(
@@ -657,7 +865,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     config.eps,
                     config.added_kv_proj_dim,
                     self._supported_attention_backends
-                    | {AttentionBackendEnum.VIDEO_SPARSE_ATTN},
+                    | {AttentionBackendEnum.VIDEO_SPARSE_ATTN, AttentionBackendEnum.SVG2_SPARSE_ATTN},
                     prefix=f"{config.prefix}.blocks.{i}",
                     attention_type=config.attention_type,
                     sla_topk=config.sla_topk,
