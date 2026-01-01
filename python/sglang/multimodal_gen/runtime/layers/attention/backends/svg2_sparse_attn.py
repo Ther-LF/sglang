@@ -868,6 +868,9 @@ class SVG2SparseAttentionMetadata(AttentionMetadata):
     num_k_clusters: int = 64
     top_p: float = 0.5
     kmeans_iters: int = 5
+    # Optional cap: for each query cluster, keep at most this many key clusters.
+    # This is typically the most important knob for latency.
+    max_k_clusters_per_q: Optional[int] = None
     # Cache for centroids (for iterative refinement)
     q_centroids_cache: Optional[torch.Tensor] = None
     k_centroids_cache: Optional[torch.Tensor] = None
@@ -893,6 +896,7 @@ class SVG2SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         kmeans_iters: int = 5,
         **kwargs: dict[str, Any],
     ) -> SVG2SparseAttentionMetadata:
+        max_k_clusters_per_q = kwargs.get("max_k_clusters_per_q", None)
         return SVG2SparseAttentionMetadata(
             current_timestep=current_timestep,
             num_frames=num_frames,
@@ -901,6 +905,7 @@ class SVG2SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             num_k_clusters=num_k_clusters,
             top_p=top_p,
             kmeans_iters=kmeans_iters,
+            max_k_clusters_per_q=max_k_clusters_per_q,
         )
 
 
@@ -938,6 +943,7 @@ class SVG2SparseAttentionImpl(AttentionImpl):
     DEFAULT_NUM_K_CLUSTERS = 64
     DEFAULT_TOP_P = 0.5
     DEFAULT_KMEANS_ITERS = 5
+    DEFAULT_MAX_K_CLUSTERS_PER_Q: Optional[int] = None
     DEFAULT_FIRST_LAYERS_FP = 0  # Number of first layers using full attention
     DEFAULT_FIRST_TIMES_FP = 0   # Timestep threshold (timesteps > this use full attention)
     
@@ -954,6 +960,7 @@ class SVG2SparseAttentionImpl(AttentionImpl):
         num_k_clusters: int = 64,
         top_p: float = 0.5,
         kmeans_iters: int = 5,
+        max_k_clusters_per_q: Optional[int] = None,
         first_layers_fp: int = 0,
         first_times_fp: float = 0,
         **extra_impl_args,
@@ -970,6 +977,7 @@ class SVG2SparseAttentionImpl(AttentionImpl):
         self.num_k_clusters = num_k_clusters
         self.top_p = top_p
         self.kmeans_iters = kmeans_iters
+        self.max_k_clusters_per_q = max_k_clusters_per_q
         self.first_layers_fp = first_layers_fp
         self.first_times_fp = first_times_fp
         
@@ -1038,6 +1046,7 @@ class SVG2SparseAttentionImpl(AttentionImpl):
             num_k_clusters = getattr(attn_metadata, 'num_k_clusters', self.num_k_clusters)
             top_p = getattr(attn_metadata, 'top_p', self.top_p)
             kmeans_iters = getattr(attn_metadata, 'kmeans_iters', self.kmeans_iters)
+            max_k_clusters_per_q = getattr(attn_metadata, 'max_k_clusters_per_q', self.max_k_clusters_per_q)
             # Get timestep for full attention decision
             timestep = getattr(attn_metadata, 'current_timestep', None)
         else:
@@ -1045,6 +1054,7 @@ class SVG2SparseAttentionImpl(AttentionImpl):
             num_k_clusters = self.num_k_clusters
             top_p = self.top_p
             kmeans_iters = self.kmeans_iters
+            max_k_clusters_per_q = self.max_k_clusters_per_q
             timestep = None
         
         # Check if we should use full attention (early layers or early timesteps)
@@ -1059,6 +1069,7 @@ class SVG2SparseAttentionImpl(AttentionImpl):
             num_k_clusters=num_k_clusters,
             top_p=top_p,
             kmeans_iters=kmeans_iters,
+            max_k_clusters_per_q=max_k_clusters_per_q,
         )
         
         return output

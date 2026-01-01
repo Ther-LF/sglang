@@ -327,6 +327,9 @@ def benchmark_full_attention(
     device: str = "cuda",
     seq_lengths: Optional[List[int]] = None,
     top_p_values: Optional[List[float]] = None,
+    fixed_clusters: Optional[int] = None,
+    max_k_per_q: Optional[int] = None,
+    kmeans_iters: int = 2,
 ):
     """Benchmark full SVG2 attention vs Torch attention."""
     print_header("Full Attention Benchmark: SVG2 vs Torch")
@@ -373,18 +376,26 @@ def benchmark_full_attention(
         
         # SVG2 with different sparsity levels
         for top_p in top_p_values:
-            # Scale clusters with sequence length to maintain reasonable block sizes
-            scaled_clusters = max(16, S // 64) # e.g. 1024->16, 4096->64, 16384->256
+            # Choose number of clusters
+            if fixed_clusters is not None:
+                scaled_clusters = fixed_clusters
+            else:
+                # Scale clusters with sequence length to maintain reasonable block sizes
+                scaled_clusters = max(16, S // 64)  # e.g. 1024->16, 4096->64, 16384->256
+
             # Cap number of active key clusters per query cluster to keep latency in check
-            max_k_per_q = max(4, min(32, scaled_clusters // 8))
+            if max_k_per_q is None:
+                max_k_per_q_eff = max(4, min(32, scaled_clusters // 8))
+            else:
+                max_k_per_q_eff = max_k_per_q
             
             svg2_time = benchmark_fn(
-                lambda tp=top_p, nc=scaled_clusters, tk=max_k_per_q: svg2_components['svg2_attention_forward'](
+                lambda tp=top_p, nc=scaled_clusters, tk=max_k_per_q_eff: svg2_components['svg2_attention_forward'](
                     q, k, v,
                     num_q_clusters=nc,
                     num_k_clusters=nc,
                     top_p=tp,
-                    kmeans_iters=2,
+                    kmeans_iters=kmeans_iters,
                     max_k_clusters_per_q=tk,
                 )
             )
@@ -398,7 +409,7 @@ def benchmark_full_attention(
             vs_sdpa_str = f"{vs_sdpa:.2f}x faster" if vs_sdpa > 1 else f"{1/vs_sdpa:.2f}x slower"
             
             sparsity = (1 - top_p) * 100
-            method_name = f"SVG2 (p={top_p}, K={scaled_clusters}, tk={max_k_per_q})"
+            method_name = f"SVG2 (p={top_p}, K={scaled_clusters}, tk={max_k_per_q_eff})"
             print(f"    {method_name:35s} | {svg2_time:12.2f} | {vs_dense_str:>12s} | {vs_sdpa_str:>12s}")
 
 
@@ -542,6 +553,12 @@ def main():
                         help="Sequence lengths to benchmark")
     parser.add_argument("--top-p", type=float, nargs="+", default=None,
                         help="Top-p values to benchmark")
+    parser.add_argument("--fixed-clusters", type=int, default=None,
+                        help="If set, use a fixed number of clusters for full-attn benchmark (disables S//64 scaling).")
+    parser.add_argument("--max-k-per-q", type=int, default=None,
+                        help="If set, cap kept key clusters per query cluster in full-attn benchmark (tk).")
+    parser.add_argument("--full-kmeans-iters", type=int, default=2,
+                        help="KMeans iterations used in full-attn benchmark.")
     parser.add_argument("--component", type=str, default="all",
                         choices=["all", "kmeans", "permutation", "block_attn", "full", "memory", "scalability"],
                         help="Which component to benchmark")
@@ -575,6 +592,9 @@ def main():
             args.device,
             seq_lengths=args.seq_lengths,
             top_p_values=args.top_p,
+            fixed_clusters=args.fixed_clusters,
+            max_k_per_q=args.max_k_per_q,
+            kmeans_iters=args.full_kmeans_iters,
         )
     
     if args.component == "all" or args.component == "memory":
