@@ -4,7 +4,6 @@ Pytest tests for SVG2 Sparse Attention Backend.
 
 Usage:
     pytest test_svg2_sparse_attn.py -v
-    pytest test_svg2_sparse_attn.py -v --benchmark  # Include benchmarks
 
 This script tests all components of the SVG2 implementation:
 1. Triton K-Means clustering
@@ -13,12 +12,12 @@ This script tests all components of the SVG2 implementation:
 4. Triton Block Sparse Attention Kernel
 5. Full SVG2 Attention
 6. Correctness comparison with Dense Attention
-7. Performance benchmarking
+
+For performance benchmarks, see: benchmark_svg2_sparse_attn.py
 """
 
 import math
-import time
-from typing import Dict, Tuple
+from typing import Dict
 
 import pytest
 import torch
@@ -460,68 +459,6 @@ class TestCorrectnessVsDense:
         out2 = run_with_seed(123)
         
         torch.testing.assert_close(out1, out2)
-
-
-# ============================================================================
-# Benchmark Tests (optional, run with --benchmark flag)
-# ============================================================================
-
-
-@pytest.mark.benchmark
-class TestBenchmark:
-    """Performance benchmarks for SVG2 attention."""
-
-    @pytest.mark.parametrize("S,K", [
-        (1024, 32),
-        (4096, 64),
-    ])
-    @torch.inference_mode()
-    def test_svg2_vs_dense_speed(self, svg2_components, device, S, K):
-        """Compare SVG2 speed to dense attention."""
-        B, H, D = 1, 16, 64
-        
-        q = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
-        k = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
-        v = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
-        
-        # Warmup
-        for _ in range(3):
-            _ = svg2_components['svg2_attention_forward'](
-                q, k, v, num_q_clusters=K, num_k_clusters=K, top_p=0.5, kmeans_iters=3
-            )
-        torch.cuda.synchronize()
-        
-        # Benchmark SVG2
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        for _ in range(10):
-            _ = svg2_components['svg2_attention_forward'](
-                q, k, v, num_q_clusters=K, num_k_clusters=K, top_p=0.5, kmeans_iters=3
-            )
-        torch.cuda.synchronize()
-        svg2_time = (time.perf_counter() - start) / 10 * 1000
-        
-        # Benchmark Dense
-        q_t = q.transpose(1, 2)
-        k_t = k.transpose(1, 2)
-        v_t = v.transpose(1, 2)
-        
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        for _ in range(10):
-            scale = 1.0 / math.sqrt(D)
-            scores = torch.matmul(q_t.float(), k_t.float().transpose(-2, -1)) * scale
-            attn = torch.softmax(scores, dim=-1)
-            _ = torch.matmul(attn, v_t.float())
-        torch.cuda.synchronize()
-        dense_time = (time.perf_counter() - start) / 10 * 1000
-        
-        speedup = dense_time / svg2_time if svg2_time > 0 else 0
-        
-        print(f"\n  S={S}, K={K}: Dense={dense_time:.2f}ms, SVG2={svg2_time:.2f}ms, Speedup={speedup:.2f}x")
-        
-        # Just verify it runs, speedup depends on hardware and sparsity
-        assert svg2_time > 0
 
 
 # ============================================================================
