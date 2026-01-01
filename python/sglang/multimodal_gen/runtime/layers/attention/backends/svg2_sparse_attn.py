@@ -460,372 +460,195 @@ def identify_dynamic_mask(
 
 
 @triton.jit
-def _flash_attn_fwd_kernel(
-    Q_ptr, K_ptr, V_ptr, O_ptr,
-    sm_scale,
-    M,  # query length
-    N,  # key length  
-    D: tl.constexpr,
-    stride_qm, stride_qd,
-    stride_kn, stride_kd,
-    stride_vn, stride_vd,
-    stride_om, stride_od,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    """Flash attention forward kernel for a single Q block."""
-    pid_m = tl.program_id(0)
-    
-    # Compute offsets
-    m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    d_offs = tl.arange(0, BLOCK_D)
-    
-    m_mask = m_offs < M
-    
-    # Load Q block
-    q_ptrs = Q_ptr + m_offs[:, None] * stride_qm + d_offs[None, :] * stride_qd
-    q = tl.load(q_ptrs, mask=m_mask[:, None] & (d_offs[None, :] < D), other=0.0).to(tl.float32)
-    
-    # Initialize accumulators for online softmax
-    o_acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
-    l_acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    m_acc = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
-    
-    # Iterate over K/V blocks
-    for n_start in range(0, N, BLOCK_N):
-        n_offs = n_start + tl.arange(0, BLOCK_N)
-        n_mask = n_offs < N
-        
-        # Load K, V
-        k_ptrs = K_ptr + n_offs[:, None] * stride_kn + d_offs[None, :] * stride_kd
-        v_ptrs = V_ptr + n_offs[:, None] * stride_vn + d_offs[None, :] * stride_vd
-        
-        k = tl.load(k_ptrs, mask=n_mask[:, None] & (d_offs[None, :] < D), other=0.0).to(tl.float32)
-        v = tl.load(v_ptrs, mask=n_mask[:, None] & (d_offs[None, :] < D), other=0.0).to(tl.float32)
-        
-        # Compute attention scores: [BLOCK_M, BLOCK_N]
-        s = tl.dot(q, tl.trans(k)) * sm_scale
-        s = tl.where(m_mask[:, None] & n_mask[None, :], s, float('-inf'))
-        
-        # Online softmax update
-        m_new = tl.maximum(m_acc, tl.max(s, axis=1))
-        alpha = tl.exp(m_acc - m_new)
-        p = tl.exp(s - m_new[:, None])
-        
-        l_acc = alpha * l_acc + tl.sum(p, axis=1)
-        # Both p and v must have same dtype for tl.dot
-        o_acc = alpha[:, None] * o_acc + tl.dot(p.to(v.dtype), v)
-        m_acc = m_new
-    
-    # Normalize output
-    o_acc = o_acc / (l_acc[:, None] + 1e-6)
-    
-    # Store output
-    o_ptrs = O_ptr + m_offs[:, None] * stride_om + d_offs[None, :] * stride_od
-    tl.store(o_ptrs, o_acc.to(Q_ptr.dtype.element_ty), mask=m_mask[:, None] & (d_offs[None, :] < D))
-
-
-def _triton_flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
-    """
-    Triton Flash Attention for a single head.
-    
-    Args:
-        q: [M, D] query
-        k: [N, D] key
-        v: [N, D] value
-        scale: attention scale
-    
-    Returns:
-        output: [M, D]
-    """
-    M, D = q.shape
-    N = k.shape[0]
-    
-    output = torch.empty_like(q)
-    
-    # Choose block sizes
-    BLOCK_M = 64
-    BLOCK_N = 64
-    BLOCK_D = triton.next_power_of_2(D)
-    
-    grid = (triton.cdiv(M, BLOCK_M),)
-    
-    _flash_attn_fwd_kernel[grid](
-        q, k, v, output,
-        scale,
-        M, N, D,
-        q.stride(0), q.stride(1),
-        k.stride(0), k.stride(1),
-        v.stride(0), v.stride(1),
-        output.stride(0), output.stride(1),
-        BLOCK_M, BLOCK_N, BLOCK_D,
-        num_warps=4,
-    )
-    
-    return output
-
-
-@triton.jit  
-def _gather_kv_kernel(
-    K_ptr, V_ptr,
-    K_out_ptr, V_out_ptr,
-    Indices_ptr,  # [total_gathered]
-    total_gathered,
-    D: tl.constexpr,
-    stride_k_s, stride_k_d,
-    stride_v_s, stride_v_d,
-    stride_ko_s, stride_ko_d,
-    stride_vo_s, stride_vo_d,
-    BLOCK_S: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    """Gather K, V by indices."""
-    pid_s = tl.program_id(0)
-    
-    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
-    d_offs = tl.arange(0, BLOCK_D)
-    
-    s_mask = s_offs < total_gathered
-    
-    # Load indices
-    indices = tl.load(Indices_ptr + s_offs, mask=s_mask, other=0)
-    
-    # Gather K
-    k_ptrs = K_ptr + indices[:, None] * stride_k_s + d_offs[None, :] * stride_k_d
-    k_vals = tl.load(k_ptrs, mask=s_mask[:, None] & (d_offs[None, :] < D), other=0.0)
-    
-    ko_ptrs = K_out_ptr + s_offs[:, None] * stride_ko_s + d_offs[None, :] * stride_ko_d
-    tl.store(ko_ptrs, k_vals, mask=s_mask[:, None] & (d_offs[None, :] < D))
-    
-    # Gather V
-    v_ptrs = V_ptr + indices[:, None] * stride_v_s + d_offs[None, :] * stride_v_d
-    v_vals = tl.load(v_ptrs, mask=s_mask[:, None] & (d_offs[None, :] < D), other=0.0)
-    
-    vo_ptrs = V_out_ptr + s_offs[:, None] * stride_vo_s + d_offs[None, :] * stride_vo_d
-    tl.store(vo_ptrs, v_vals, mask=s_mask[:, None] & (d_offs[None, :] < D))
-
-
-def _gather_kv_triton(k: torch.Tensor, v: torch.Tensor, indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Gather K, V using Triton kernel."""
-    total_gathered = indices.shape[0]
-    D = k.shape[1]
-    
-    k_out = torch.empty(total_gathered, D, dtype=k.dtype, device=k.device)
-    v_out = torch.empty(total_gathered, D, dtype=v.dtype, device=v.device)
-    
-    BLOCK_S = 64
-    BLOCK_D = triton.next_power_of_2(D)
-    
-    grid = (triton.cdiv(total_gathered, BLOCK_S),)
-    
-    _gather_kv_kernel[grid](
-        k, v, k_out, v_out,
-        indices.to(torch.int32),
-        total_gathered, D,
-        k.stride(0), k.stride(1),
-        v.stride(0), v.stride(1),
-        k_out.stride(0), k_out.stride(1),
-        v_out.stride(0), v_out.stride(1),
-        BLOCK_S, BLOCK_D,
-        num_warps=4,
-    )
-    
-    return k_out, v_out
-
-
-def _compute_block_boundaries(cluster_sizes: torch.Tensor) -> torch.Tensor:
-    """
-    Compute block start indices from cluster sizes.
-    
-    Args:
-        cluster_sizes: [BH, K] cluster sizes
-    
-    Returns:
-        block_starts: [BH, K+1] cumulative start indices
-    """
-    BH, K = cluster_sizes.shape
-    device = cluster_sizes.device
-    block_starts = torch.zeros(BH, K + 1, dtype=torch.int64, device=device)
-    block_starts[:, 1:] = cluster_sizes.to(torch.int64).cumsum(dim=-1)
-    return block_starts
-
-
-@triton.jit
-def _gather_selected_kv_kernel(
-    # Input tensors
-    K_ptr, V_ptr,
-    # Output tensors (gathered)
-    K_out_ptr, V_out_ptr,
-    # Indices
-    K_starts_ptr,  # [Kk+1] block boundaries for this bh
-    selected_blocks_ptr,  # [num_selected] indices of selected blocks
-    # Dimensions
-    num_selected,
-    D: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    """
-    Gather selected key/value blocks into contiguous memory.
-    Grid: (num_tokens_to_gather,)
-    """
-    token_idx = tl.program_id(0)
-    
-    # Find which selected block this token belongs to
-    cumsum = 0
-    block_local_idx = 0
-    selected_block_idx = 0
-    
-    for i in range(num_selected):
-        ki = tl.load(selected_blocks_ptr + i)
-        k_start = tl.load(K_starts_ptr + ki)
-        k_end = tl.load(K_starts_ptr + ki + 1)
-        block_len = k_end - k_start
-        
-        if token_idx >= cumsum and token_idx < cumsum + block_len:
-            selected_block_idx = i
-            block_local_idx = token_idx - cumsum
-            # Source index in original K/V
-            src_idx = k_start + block_local_idx
-            
-            # Copy K
-            d_range = tl.arange(0, BLOCK_D)
-            mask = d_range < D
-            k_val = tl.load(K_ptr + src_idx * D + d_range, mask=mask, other=0.0)
-            tl.store(K_out_ptr + token_idx * D + d_range, k_val, mask=mask)
-            
-            # Copy V
-            v_val = tl.load(V_ptr + src_idx * D + d_range, mask=mask, other=0.0)
-            tl.store(V_out_ptr + token_idx * D + d_range, v_val, mask=mask)
-            return
-        
-        cumsum += block_len
-
-
-@triton.jit
-def _flash_attn_fwd_inner_kernel(
-    # Pointers
-    Q_ptr, K_ptr, V_ptr, O_ptr,
-    # Dimensions
-    M, N, D: tl.constexpr,  # M = query length, N = key length
-    stride_qm, stride_kn, stride_vn, stride_om,
-    # Scale
+def _dynamic_block_sparse_fwd_kernel(
+    Q,
+    K,
+    V,
+    Out,
+    dynamic_map,
+    qc_cum_size,
+    kc_cum_size,
+    stride_qb,
+    stride_qh,
+    stride_qs,
+    stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_ks,
+    stride_kd,
+    stride_vb,
+    stride_vh,
+    stride_vs,
+    stride_vd,
+    stride_ob,
+    stride_oh,
+    stride_os,
+    stride_od,
+    stride_dmap_b,
+    stride_dmap_h,
+    stride_dmap_qc,
+    stride_dmap_kc,
+    stride_qcs_b,
+    stride_qcs_h,
+    stride_qcs_qc,
+    stride_kcs_b,
+    stride_kcs_h,
+    stride_kcs_kc,
+    B,
+    H,
+    S,
+    D,
     scale,
-    # Block sizes
+    QC_NUM: tl.constexpr,
+    KC_NUM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """
-    Standard FlashAttention forward kernel for a single (batch, head) pair.
-    Used after gathering selected K/V tokens.
-    
-    Grid: (ceil(M / BLOCK_M),)
+    Triton kernel for dynamic block sparse attention.
+    Each program computes attention for one query block within a batch/head.
+    Processes query block in chunks of BLOCK_M.
+    Iterates through key blocks, checking dynamic_map.
+    Processes key/value blocks in chunks of BLOCK_N.
+    Uses online softmax.
     """
-    pid_m = tl.program_id(0)
-    
-    # Query block range
-    m_start = pid_m * BLOCK_M
-    m_offsets = m_start + tl.arange(0, BLOCK_M)
-    m_mask = m_offsets < M
-    
-    # Load query block [BLOCK_M, D]
-    d_range = tl.arange(0, BLOCK_D)
-    d_mask = d_range < D
-    
-    q_ptrs = Q_ptr + m_offsets[:, None] * stride_qm + d_range[None, :]
-    q = tl.load(q_ptrs, mask=m_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
-    
-    # Initialize online softmax accumulators
-    m_i = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    o_i = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
-    
-    # Iterate over key blocks
-    for n_start in range(0, N, BLOCK_N):
-        n_offsets = n_start + tl.arange(0, BLOCK_N)
-        n_mask = n_offsets < N
-        
-        # Load key block [BLOCK_N, D]
-        k_ptrs = K_ptr + n_offsets[:, None] * stride_kn + d_range[None, :]
-        k = tl.load(k_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
-        
-        # Compute attention scores [BLOCK_M, BLOCK_N]
-        # q: [BLOCK_M, D], k: [BLOCK_N, D] -> scores: [BLOCK_M, BLOCK_N]
-        scores = tl.dot(q, tl.trans(k)) * scale
-        
-        # Mask out invalid positions
-        scores = tl.where(
-            m_mask[:, None] & n_mask[None, :],
-            scores,
-            float('-inf')
-        )
-        
-        # Online softmax update
-        m_ij = tl.max(scores, axis=1)
-        m_new = tl.maximum(m_i, m_ij)
-        
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(scores - m_new[:, None])
-        
-        l_ij = tl.sum(p, axis=1)
-        l_new = alpha * l_i + l_ij
-        
-        # Load value block [BLOCK_N, D]
-        v_ptrs = V_ptr + n_offsets[:, None] * stride_vn + d_range[None, :]
-        v = tl.load(v_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
-        
-        # Update output accumulator
-        o_i = alpha[:, None] * o_i + tl.dot(p.to(v.dtype), v)
-        
-        m_i = m_new
-        l_i = l_new
-    
-    # Normalize
-    o_i = o_i / l_i[:, None]
-    
-    # Store output
-    o_ptrs = O_ptr + m_offsets[:, None] * stride_om + d_range[None, :]
-    tl.store(o_ptrs, o_i.to(tl.float16), mask=m_mask[:, None] & d_mask[None, :])
+    # --- Grid Calculation ---
+    # Each program instance handles one query block for a specific batch and head
+    pid = tl.program_id(axis=0)
 
+    # Calculate batch, head, and query block index
+    pid_q_block_global = pid  # 0 to B*H*QC_NUM - 1
+    
+    # Need to map pid (0.. B*H*QC_NUM-1) back to (b, h, q_block_idx)
+    # q_block_idx changes fastest, then h, then b
+    q_block_idx = pid_q_block_global % QC_NUM
+    pid_h_temp = pid_q_block_global // QC_NUM
+    h = pid_h_temp % H
+    b = pid_h_temp // H
 
-def _triton_block_attention(
-    q_block: torch.Tensor,  # [q_len, D]
-    k_selected: torch.Tensor,  # [k_len, D]
-    v_selected: torch.Tensor,  # [k_len, D]
-    scale: float,
-) -> torch.Tensor:
-    """
-    Compute attention for one query block with selected K/V using Triton.
-    """
-    M, D = q_block.shape
-    N = k_selected.shape[0]
-    
-    if M == 0 or N == 0:
-        return torch.zeros_like(q_block)
-    
-    output = torch.zeros_like(q_block)
-    
-    BLOCK_M = min(64, triton.next_power_of_2(M))
-    BLOCK_N = min(64, triton.next_power_of_2(N))
-    BLOCK_D = triton.next_power_of_2(D)
-    
-    grid = (triton.cdiv(M, BLOCK_M),)
-    
-    _flash_attn_fwd_inner_kernel[grid](
-        q_block, k_selected, v_selected, output,
-        M, N, D,
-        D,  # stride_qm
-        D,  # stride_kn
-        D,  # stride_vn
-        D,  # stride_om
-        scale,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_D=BLOCK_D,
-    )
-    
-    return output
+    # --- Load Q block info (start/end offsets) ---
+    qcs_offset = b * stride_qcs_b + h * stride_qcs_h
+    q_start_offset = tl.load(qc_cum_size + qcs_offset + q_block_idx * stride_qcs_qc)
+    q_end_offset = tl.load(qc_cum_size + qcs_offset + (q_block_idx + 1) * stride_qcs_qc)
+    q_block_size = q_end_offset - q_start_offset
+
+    # Early exit if the query block is empty
+    if q_block_size == 0:
+        return
+
+    # --- Pointers setup ---
+    q_ptr_base = Q + b * stride_qb + h * stride_qh + q_start_offset * stride_qs
+    k_ptr_base = K + b * stride_kb + h * stride_kh
+    v_ptr_base = V + b * stride_vb + h * stride_vh
+    out_ptr_base = Out + b * stride_ob + h * stride_oh + q_start_offset * stride_os
+    dmap_ptr = dynamic_map + b * stride_dmap_b + h * stride_dmap_h + q_block_idx * stride_dmap_qc
+    kcs_ptr = kc_cum_size + b * stride_kcs_b + h * stride_kcs_h
+
+    # --- Iterate over the query block rows in chunks of BLOCK_M ---
+    offs_qm = tl.arange(0, BLOCK_M)  # Query block row offsets [0, 1, ..., BLOCK_M-1]
+    offs_d = tl.arange(0, BLOCK_D)  # Dimension offsets [0, 1, ..., BLOCK_D-1]
+
+    for q_chunk_start in range(0, q_block_size, BLOCK_M):
+        q_chunk_rows = offs_qm + q_chunk_start
+        q_rows_mask = q_chunk_rows < q_block_size  # Mask for valid rows in this Q chunk [BLOCK_M]
+
+        # --- Initialize accumulators for this Q chunk ---
+        m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")  # Max score
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)  # Sum of exp(scores - max)
+        acc_o = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)  # Accumulated output
+
+        # --- Load Q chunk ---
+        q_ptr = q_ptr_base + q_chunk_rows[:, None] * stride_qs + offs_d[None, :]
+        # Mask ensures we don't read out of bounds for the query block or dimension D
+        mask_q = q_rows_mask[:, None] & (offs_d[None, :] < D)
+        q_chunk = tl.load(q_ptr, mask=mask_q, other=0.0)  # Shape: [BLOCK_M, BLOCK_D]
+
+        # --- Inner loop over K blocks (columns in the block sparse map) ---
+        for k_block_idx in range(KC_NUM):
+            # --- Check dynamic_map: Is this block active? ---
+            is_active = tl.load(dmap_ptr + k_block_idx * stride_dmap_kc)
+            if is_active:  # Process block only if it's active
+                # --- Load K block info (start/end offsets) ---
+                k_start_offset = tl.load(kcs_ptr + k_block_idx * stride_kcs_kc)
+                k_end_offset = tl.load(kcs_ptr + (k_block_idx + 1) * stride_kcs_kc)
+                k_block_size = k_end_offset - k_start_offset
+
+                # Skip if the key block is empty (inside the active block check)
+                if k_block_size > 0:
+
+                    k_block_ptr_base = k_ptr_base + k_start_offset * stride_ks
+                    v_block_ptr_base = v_ptr_base + k_start_offset * stride_vs
+
+                    # --- Loop over K block chunks (size BLOCK_N) ---
+                    offs_kn = tl.arange(0, BLOCK_N)  # Key block row offsets [0, ..., BLOCK_N-1]
+                    for k_chunk_start in range(0, k_block_size, BLOCK_N):
+                        k_chunk_rows = offs_kn + k_chunk_start
+                        k_rows_mask = k_chunk_rows < k_block_size  # Mask for valid rows in this K/V chunk [BLOCK_N]
+
+                        # --- Load K, V chunks ---
+                        k_ptr = k_block_ptr_base + k_chunk_rows[:, None] * stride_ks + offs_d[None, :]
+                        v_ptr = v_block_ptr_base + k_chunk_rows[:, None] * stride_vs + offs_d[None, :]
+
+                        # Mask ensures we don't read out of bounds for the key block or dimension D
+                        mask_kv = k_rows_mask[:, None] & (offs_d[None, :] < D)
+                        k_chunk = tl.load(k_ptr, mask=mask_kv, other=0.0)  # Shape: [BLOCK_N, BLOCK_D]
+                        v_chunk = tl.load(v_ptr, mask=mask_kv, other=0.0)  # Shape: [BLOCK_N, BLOCK_D]
+
+                        # --- Compute Scores (Attention) ---
+                        # QK^T: [BLOCK_M, BLOCK_D] @ [BLOCK_D, BLOCK_N] -> [BLOCK_M, BLOCK_N]
+                        s_ij_chunk = tl.dot(q_chunk, k_chunk.T) * scale
+
+                        # IMPORTANT: Mask out scores corresponding to padding in K before max/softmax
+                        # Set scores for invalid K elements to -inf
+                        s_ij_chunk = tl.where(k_rows_mask[None, :], s_ij_chunk, -float("inf"))
+                        # Mask out scores for invalid Q elements as well (although q_chunk elements are 0, avoid potential issues)
+                        s_ij_chunk = tl.where(q_rows_mask[:, None], s_ij_chunk, -float("inf"))
+
+                        # --- Online Softmax Update ---
+                        # Current max for this Q-K chunk interaction
+                        m_ij_chunk = tl.max(s_ij_chunk, axis=1)  # Shape: [BLOCK_M]
+
+                        # Update overall max (across K chunks seen so far for this Q chunk)
+                        m_new = tl.maximum(m_i, m_ij_chunk)  # Shape: [BLOCK_M]
+
+                        # Calculate scaled probabilities P_ij = exp(S_ij - m_new)
+                        p_ij_chunk = tl.exp(s_ij_chunk - m_new[:, None])  # Shape: [BLOCK_M, BLOCK_N]
+                        # Zero out probabilities for masked K elements before summing
+                        p_ij_chunk = tl.where(k_rows_mask[None, :], p_ij_chunk, 0.0)
+
+                        # Calculate scaling factor for previous accumulator state
+                        exp_m_diff = tl.exp(m_i - m_new)  # Shape: [BLOCK_M]
+
+                        # Update sum accumulator (denominator L)
+                        l_i_chunk = tl.sum(p_ij_chunk, axis=1)  # Sum probabilities for this chunk, shape [BLOCK_M]
+                        l_i = (l_i * exp_m_diff) + l_i_chunk  # Shape: [BLOCK_M]
+
+                        # Update output accumulator O
+                        # P_ij @ V_j: [BLOCK_M, BLOCK_N] @ [BLOCK_N, BLOCK_D] -> [BLOCK_M, BLOCK_D]
+                        # Ensure p_ij_chunk is the correct dtype for dot product
+                        p_ij_chunk_casted = p_ij_chunk.to(V.dtype.element_ty)
+                        o_chunk = tl.dot(p_ij_chunk_casted, v_chunk)  # Shape: [BLOCK_M, BLOCK_D]
+
+                        acc_o = (acc_o * exp_m_diff[:, None]) + o_chunk  # Shape: [BLOCK_M, BLOCK_D]
+
+                        # Update max for the next K chunk/block
+                        m_i = m_new
+            # End of 'if is_active:' block
+        # --- End of loop over K blocks ---
+
+        # --- Finalize output for this Q chunk ---
+        # Normalize the accumulated output: O = acc_o / l_i
+        # Add epsilon to l_i to avoid division by zero
+        l_i_safe = tl.where(l_i == 0, 1.0, l_i)  # Avoid 0/0 -> NaN
+        o_final_chunk = acc_o / (l_i_safe[:, None])
+        o_final_chunk = tl.where(l_i[:, None] == 0, 0.0, o_final_chunk)  # Ensure output is 0 if l_i was 0
+
+        # --- Write output chunk to global memory ---
+        out_ptr = out_ptr_base + q_chunk_rows[:, None] * stride_os + offs_d[None, :]
+        # Mask ensures we don't write out of bounds for the query block or dimension D
+        mask_out = q_rows_mask[:, None] & (offs_d[None, :] < D)
+        tl.store(out_ptr, o_final_chunk.to(Out.dtype.element_ty), mask=mask_out)
 
 
 def block_sparse_attention(
@@ -837,98 +660,79 @@ def block_sparse_attention(
     k_cluster_sizes: torch.Tensor,  # [B, H, Kk]
 ) -> torch.Tensor:
     """
-    Block sparse attention with variable block sizes.
+    Block sparse attention with variable block sizes using Triton.
     
-    Strategy: For each query block, gather selected K/V into contiguous memory,
-    then use a Triton FlashAttention kernel. 
-    
-    Performance notes:
-    - Still has O(BH * Kq) Python iterations, but each iteration is fast
-    - GPU-CPU sync happens once per BH (not per iteration)
-    - Triton FlashAttention kernel for actual attention computation
-    - True O(1) sparse attention requires flashinfer integration
-    
-    Memory: O(max_q_block * selected_k_tokens) instead of O(S^2)
+    Replaces the previous implementation that used Python loops over blocks.
+    Now uses a single Triton kernel dispatch for the entire batch.
     """
     B, H, S, D = q.shape
-    device = q.device
+    qc_num = q_cluster_sizes.shape[-1]
+    kc_num = k_cluster_sizes.shape[-1]
     dtype = q.dtype
+    
+    # Assertions and checks
+    assert q.is_cuda and k.is_cuda and v.is_cuda, "Inputs must be CUDA tensors"
+    assert block_mask.is_cuda and q_cluster_sizes.is_cuda and k_cluster_sizes.is_cuda
+    
+    # Calculate scale factor (using float32 for stability)
     scale = 1.0 / math.sqrt(D)
     
-    Kq = q_cluster_sizes.shape[-1]
-    Kk = k_cluster_sizes.shape[-1]
-    
-    # Reshape for processing
-    q_flat = q.reshape(B * H, S, D).contiguous()
-    k_flat = k.reshape(B * H, S, D).contiguous()
-    v_flat = v.reshape(B * H, S, D).contiguous()
-    block_mask_flat = block_mask.reshape(B * H, Kq, Kk)
-    q_sizes_flat = q_cluster_sizes.reshape(B * H, Kq).to(torch.int64)
-    k_sizes_flat = k_cluster_sizes.reshape(B * H, Kk).to(torch.int64)
-    
-    # Compute block boundaries on GPU
-    q_starts = _compute_block_boundaries(q_sizes_flat)  # [BH, Kq+1]
-    k_starts = _compute_block_boundaries(k_sizes_flat)  # [BH, Kk+1]
-    
-    # ========== KEY OPTIMIZATION: Single GPU->CPU sync for all boundaries ==========
-    # Transfer all block boundaries to CPU at once (one sync instead of many)
-    q_starts_cpu = q_starts.cpu().numpy()  # [BH, Kq+1]
-    k_starts_cpu = k_starts.cpu().numpy()  # [BH, Kk+1]
-    # Also transfer mask to CPU for fast iteration
-    mask_cpu = block_mask_flat.cpu().numpy()  # [BH, Kq, Kk]
+    # Precompute cumulative sizes (keep on device)
+    # Note: original code expected q_cluster_sizes to be used for block boundaries
+    # We create cumulative sizes adding a 0 at the start
+    qc_cum_size = torch.cumsum(torch.cat([torch.zeros_like(q_cluster_sizes[..., :1]), q_cluster_sizes], dim=-1), dim=-1).int()
+    kc_cum_size = torch.cumsum(torch.cat([torch.zeros_like(k_cluster_sizes[..., :1]), k_cluster_sizes], dim=-1), dim=-1).int()
     
     # Output tensor
-    output = torch.zeros_like(q_flat)
+    out = torch.empty_like(q)
     
-    BH = B * H
+    # Triton kernel config
+    BLOCK_D = triton.next_power_of_2(D)
     
-    # Process each (batch, head) 
-    for bh in range(BH):
-        q_bh = q_flat[bh]  # [S, D]
-        k_bh = k_flat[bh]  # [S, D]
-        v_bh = v_flat[bh]  # [S, D]
+    if S <= 512:
+        BLOCK_M = 64
+        BLOCK_N = 64
+    elif S <= 1024:
+        BLOCK_M = 64
+        BLOCK_N = 64
+    else:
+        BLOCK_M = 128
+        BLOCK_N = 64
         
-        # Use pre-transferred CPU arrays (no sync here)
-        q_starts_bh = q_starts_cpu[bh]  # [Kq+1]
-        k_starts_bh = k_starts_cpu[bh]  # [Kk+1]
-        mask_bh = mask_cpu[bh]  # [Kq, Kk]
-        
-        for qi in range(Kq):
-            q_start = int(q_starts_bh[qi])
-            q_end = int(q_starts_bh[qi + 1])
-            if q_start >= q_end:
-                continue
-            
-            q_block = q_bh[q_start:q_end]  # [q_size, D]
-            
-            # Find selected key blocks from CPU mask
-            k_block_indices = mask_bh[qi].nonzero()[0]
-            
-            if len(k_block_indices) == 0:
-                continue
-            
-            # Build k indices list (CPU operations, fast)
-            k_indices_list = []
-            for ki in k_block_indices:
-                k_start = int(k_starts_bh[ki])
-                k_end = int(k_starts_bh[ki + 1])
-                if k_start < k_end:
-                    k_indices_list.extend(range(k_start, k_end))
-            
-            if len(k_indices_list) == 0:
-                continue
-            
-            # Single GPU operation to gather K/V
-            k_indices = torch.tensor(k_indices_list, device=device, dtype=torch.long)
-            k_selected = k_bh[k_indices]  # [total_k, D]
-            v_selected = v_bh[k_indices]  # [total_k, D]
-            
-            # Use Triton FlashAttention for this block
-            out_block = _triton_block_attention(q_block, k_selected, v_selected, scale)
-            
-            output[bh, q_start:q_end] = out_block
+    BLOCK_M = min(BLOCK_M, S)
+    BLOCK_N = min(BLOCK_N, S)
     
-    return output.reshape(B, H, S, D)
+    # Launch grid: One program per query block per batch/head
+    grid = (B * H * qc_num,)
+    
+    _dynamic_block_sparse_fwd_kernel[grid](
+        q,
+        k,
+        v,
+        out,
+        block_mask,
+        qc_cum_size,
+        kc_cum_size,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        block_mask.stride(0), block_mask.stride(1), block_mask.stride(2), block_mask.stride(3),
+        qc_cum_size.stride(0), qc_cum_size.stride(1), qc_cum_size.stride(2),
+        kc_cum_size.stride(0), kc_cum_size.stride(1), kc_cum_size.stride(2),
+        B,
+        H,
+        S,
+        D,
+        scale,
+        QC_NUM=qc_num,
+        KC_NUM=kc_num,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=BLOCK_D,
+    )
+    
+    return out
 
 
 # ============================================================================

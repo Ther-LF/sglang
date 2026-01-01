@@ -325,6 +325,120 @@ class TestTritonBlockSparseAttention:
         
         assert output.shape == q.shape, f"Shape mismatch: {output.shape} vs {q.shape}"
 
+    def _ref_block_sparse_attention(self, q, k, v, block_mask, q_cluster_sizes, k_cluster_sizes):
+        """Reference implementation using pure PyTorch."""
+        B, H, S, D = q.shape
+        Kq = q_cluster_sizes.shape[-1]
+        Kk = k_cluster_sizes.shape[-1]
+        out = torch.zeros_like(q)
+        scale = 1.0 / math.sqrt(D)
+        
+        # Calculate block boundaries
+        q_cluster_sizes_cpu = q_cluster_sizes.cpu()
+        k_cluster_sizes_cpu = k_cluster_sizes.cpu()
+        
+        q_ends = torch.cumsum(q_cluster_sizes_cpu, dim=-1)
+        q_starts = torch.cat([torch.zeros_like(q_ends[..., :1]), q_ends[..., :-1]], dim=-1)
+        
+        k_ends = torch.cumsum(k_cluster_sizes_cpu, dim=-1)
+        k_starts = torch.cat([torch.zeros_like(k_ends[..., :1]), k_ends[..., :-1]], dim=-1)
+        
+        q_cpu = q.float().cpu()
+        k_cpu = k.float().cpu()
+        v_cpu = v.float().cpu()
+        mask_cpu = block_mask.cpu()
+        
+        for b in range(B):
+            for h in range(H):
+                for i in range(Kq):
+                    qs, qe = int(q_starts[b, h, i]), int(q_ends[b, h, i])
+                    if qs >= qe: continue
+                    q_blk = q_cpu[b, h, qs:qe] # [M, D]
+                    
+                    # Gather valid keys
+                    k_list = []
+                    v_list = []
+                    for j in range(Kk):
+                        if mask_cpu[b, h, i, j]:
+                            ks, ke = int(k_starts[b, h, j]), int(k_ends[b, h, j])
+                            if ks < ke:
+                                k_list.append(k_cpu[b, h, ks:ke])
+                                v_list.append(v_cpu[b, h, ks:ke])
+                    
+                    if not k_list:
+                        continue
+                        
+                    k_cat = torch.cat(k_list, dim=0) # [N_total, D]
+                    v_cat = torch.cat(v_list, dim=0) # [N_total, D]
+                    
+                    # Attention
+                    scores = torch.matmul(q_blk, k_cat.transpose(0, 1)) * scale
+                    probs = torch.softmax(scores, dim=-1)
+                    out_blk = torch.matmul(probs, v_cat)
+                    
+                    out[b, h, qs:qe] = out_blk.to(out.dtype).to(out.device)
+        
+        return out.to(q.device)
+
+    @torch.inference_mode()
+    def test_sparse_mask_correctness(self, svg2_components, device):
+        """Test block sparse attention with random sparse mask."""
+        B, H, S, D = 1, 4, 256, 64
+        Kq, Kk = 8, 8
+        
+        torch.manual_seed(42)
+        q = torch.randn(B, H, S, D, device=device, dtype=torch.float16)
+        k = torch.randn(B, H, S, D, device=device, dtype=torch.float16)
+        v = torch.randn(B, H, S, D, device=device, dtype=torch.float16)
+        
+        block_size = S // Kq
+        q_cluster_sizes = torch.full((B, H, Kq), block_size, dtype=torch.int32, device=device)
+        k_cluster_sizes = torch.full((B, H, Kk), block_size, dtype=torch.int32, device=device)
+        
+        # Random sparse mask
+        block_mask = torch.rand(B, H, Kq, Kk, device=device) > 0.5
+        
+        output = svg2_components['block_sparse_attention'](
+            q, k, v, block_mask, q_cluster_sizes, k_cluster_sizes
+        )
+        
+        ref_output = self._ref_block_sparse_attention(
+            q, k, v, block_mask, q_cluster_sizes, k_cluster_sizes
+        )
+        
+        max_diff = (output - ref_output).abs().max().item()
+        assert max_diff < 0.1, f"Max diff too large: {max_diff}"
+
+    @torch.inference_mode()
+    def test_variable_block_sizes(self, svg2_components, device):
+        """Test with variable block sizes."""
+        B, H, S, D = 1, 4, 256, 64
+        Kq, Kk = 4, 4
+        
+        torch.manual_seed(42)
+        q = torch.randn(B, H, S, D, device=device, dtype=torch.float16)
+        k = torch.randn(B, H, S, D, device=device, dtype=torch.float16)
+        v = torch.randn(B, H, S, D, device=device, dtype=torch.float16)
+        
+        # Variable block sizes that sum to S=256
+        # e.g., [32, 64, 96, 64]
+        sizes_list = [32, 64, 96, 64]
+        q_cluster_sizes = torch.tensor(sizes_list, dtype=torch.int32, device=device).expand(B, H, Kq)
+        k_cluster_sizes = torch.tensor(sizes_list, dtype=torch.int32, device=device).expand(B, H, Kk)
+        
+        block_mask = torch.rand(B, H, Kq, Kk, device=device) > 0.5
+        
+        output = svg2_components['block_sparse_attention'](
+            q, k, v, block_mask, q_cluster_sizes, k_cluster_sizes
+        )
+        
+        ref_output = self._ref_block_sparse_attention(
+            q, k, v, block_mask, q_cluster_sizes, k_cluster_sizes
+        )
+        
+        max_diff = (output - ref_output).abs().max().item()
+        assert max_diff < 0.1, f"Max diff too large: {max_diff}"
+
 
 # ============================================================================
 # Test: Full SVG2 Attention
