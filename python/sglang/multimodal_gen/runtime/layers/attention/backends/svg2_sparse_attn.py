@@ -419,6 +419,7 @@ def identify_dynamic_mask(
     k_cluster_sizes: torch.Tensor,  # [B, H, Kk]
     top_p: float = 0.5,
     min_kc_ratio: float = 0.0,
+    max_k_clusters_per_q: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Generate dynamic block mask based on centroid similarity.
@@ -430,6 +431,7 @@ def identify_dynamic_mask(
         k_cluster_sizes: Size of each key cluster
         top_p: Keep top-p fraction of blocks by importance
         min_kc_ratio: Minimum ratio of k clusters to keep
+        max_k_clusters_per_q: Optional cap of kept key clusters per query cluster
     
     Returns:
         block_mask: [B, H, Kq, Kk] boolean mask
@@ -446,6 +448,16 @@ def identify_dynamic_mask(
     # Weight by cluster sizes (larger clusters are more important)
     weights = q_cluster_sizes[:, :, :, None].float() * k_cluster_sizes[:, :, None, :].float()
     weighted_scores = scores * weights
+
+    # Optional per-query top-k cap to bound active blocks and improve latency
+    if max_k_clusters_per_q is not None:
+        target_k = max(1, int(math.ceil(top_p * Kk)))
+        target_k = min(target_k, max_k_clusters_per_q, Kk)
+        # Select top-k key clusters for each query cluster
+        _, topk_idx = torch.topk(weighted_scores, k=target_k, dim=-1)
+        block_mask = torch.zeros((B, H, Kq, Kk), device=device, dtype=torch.bool)
+        block_mask.scatter_(-1, topk_idx, True)
+        return block_mask
     
     # Softmax to get importance
     importance = torch.softmax(weighted_scores.reshape(B, H, -1), dim=-1)
@@ -766,6 +778,7 @@ def svg2_attention_forward(
     num_k_clusters: int = 64,
     top_p: float = 0.5,
     kmeans_iters: int = 5,
+    max_k_clusters_per_q: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Complete SVG2 (Semantic-Aware Permutation) attention forward pass.
@@ -776,6 +789,7 @@ def svg2_attention_forward(
         num_k_clusters: Number of key clusters
         top_p: Top-p fraction for block mask
         kmeans_iters: K-Means iterations
+        max_k_clusters_per_q: Optional cap of kept key clusters per query cluster
     
     Returns:
         output: Attention output [B, S, H, D]
@@ -815,6 +829,7 @@ def svg2_attention_forward(
         q_centroids, k_centroids,
         q_cluster_sizes, k_cluster_sizes,
         top_p=top_p,
+        max_k_clusters_per_q=max_k_clusters_per_q,
     )
     
     # Step 3: Permute Q, K, V by cluster labels

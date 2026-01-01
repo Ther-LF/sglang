@@ -375,14 +375,17 @@ def benchmark_full_attention(
         for top_p in top_p_values:
             # Scale clusters with sequence length to maintain reasonable block sizes
             scaled_clusters = max(16, S // 64) # e.g. 1024->16, 4096->64, 16384->256
+            # Cap number of active key clusters per query cluster to keep latency in check
+            max_k_per_q = max(4, min(32, scaled_clusters // 8))
             
             svg2_time = benchmark_fn(
-                lambda tp=top_p, nc=scaled_clusters: svg2_components['svg2_attention_forward'](
+                lambda tp=top_p, nc=scaled_clusters, tk=max_k_per_q: svg2_components['svg2_attention_forward'](
                     q, k, v,
                     num_q_clusters=nc,
                     num_k_clusters=nc,
                     top_p=tp,
-                    kmeans_iters=3,
+                    kmeans_iters=2,
+                    max_k_clusters_per_q=tk,
                 )
             )
             
@@ -395,7 +398,8 @@ def benchmark_full_attention(
             vs_sdpa_str = f"{vs_sdpa:.2f}x faster" if vs_sdpa > 1 else f"{1/vs_sdpa:.2f}x slower"
             
             sparsity = (1 - top_p) * 100
-            print(f"    {'SVG2 (p=' + str(top_p) + f', K={scaled_clusters})':35s} | {svg2_time:12.2f} | {vs_dense_str:>12s} | {vs_sdpa_str:>12s}")
+            method_name = f"SVG2 (p={top_p}, K={scaled_clusters}, tk={max_k_per_q})"
+            print(f"    {method_name:35s} | {svg2_time:12.2f} | {vs_dense_str:>12s} | {vs_sdpa_str:>12s}")
 
 
 # ============================================================================
