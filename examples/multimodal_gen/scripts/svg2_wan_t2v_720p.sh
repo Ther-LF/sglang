@@ -76,6 +76,9 @@ SAMPLING_ARGS=(
     --output-file-name "$output_file"
 )
 
+# Get script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Run with sglang CLI
 sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
 

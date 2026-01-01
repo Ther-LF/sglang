@@ -98,8 +98,12 @@ echo "========================================"
 # Create output directory
 mkdir -p "${output_dir}/${output_feature}"
 
+# Get script directory and project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+
 # Run the Python script
-python examples/multimodal_gen/svg2_wan_i2v_inference.py \
+python "${SCRIPT_DIR}/../svg2_wan_i2v_inference.py" \
     --model-path "$model_id" \
     --prompt "$prompt" \
     --image-path "$image_path" \
