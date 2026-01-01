@@ -170,7 +170,7 @@ class TestPermutation:
         # Each row should be a permutation of [0, S-1]
         for i in range(B * H):
             indices_sorted = sorted_indices[i].sort()[0]
-            expected = torch.arange(S, device=device)
+            expected = torch.arange(S, device=device, dtype=sorted_indices.dtype)
             torch.testing.assert_close(indices_sorted, expected)
 
 
@@ -572,7 +572,16 @@ class TestBackendIntegration:
         k = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
         v = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
         
-        metadata = SVG2SparseAttentionMetadata()
+        # Create metadata with required parameters
+        metadata = SVG2SparseAttentionMetadata(
+            current_timestep=0,
+            num_frames=16,
+            num_tokens_per_frame=16,  # S // num_frames
+            num_q_clusters=8,
+            num_k_clusters=8,
+            top_p=0.5,
+            kmeans_iters=3,
+        )
         
         output = impl.forward(q, k, v, metadata)
         

@@ -39,6 +39,8 @@ logger = init_logger(__name__)
 def _pairwise_distance_kernel(
     X_ptr,           # [N, D]
     C_ptr,           # [K, D]
+    X_sqnorm_ptr,    # [N] - precomputed ||x||^2
+    C_sqnorm_ptr,    # [K] - precomputed ||c||^2
     Dist_ptr,        # [N, K]
     N: tl.constexpr,
     K: tl.constexpr,
@@ -47,7 +49,10 @@ def _pairwise_distance_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Compute pairwise squared Euclidean distance between X and centroids C."""
+    """
+    Compute pairwise squared Euclidean distance using:
+    ||x - c||^2 = ||x||^2 + ||c||^2 - 2 * x @ c.T
+    """
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     
@@ -60,29 +65,30 @@ def _pairwise_distance_kernel(
     n_mask = n_offsets < N
     k_mask = k_offsets < K
     
-    # Accumulate distance in float32
-    dist = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    # Load precomputed squared norms
+    x_sqnorm = tl.load(X_sqnorm_ptr + n_offsets, mask=n_mask, other=0.0)  # [BLOCK_N]
+    c_sqnorm = tl.load(C_sqnorm_ptr + k_offsets, mask=k_mask, other=0.0)  # [BLOCK_K]
     
+    # Initialize dot product accumulator
+    dot_prod = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    
+    # Compute x @ c.T in chunks
     for d_start in range(0, D, BLOCK_D):
         d_offsets = d_start + tl.arange(0, BLOCK_D)
         d_mask = d_offsets < D
         
-        # Load X[n, d]
+        # Load X[n, d] and C[k, d]
         x_ptrs = X_ptr + n_offsets[:, None] * D + d_offsets[None, :]
-        x = tl.load(x_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
-        
-        # Load C[k, d]
         c_ptrs = C_ptr + k_offsets[:, None] * D + d_offsets[None, :]
+        
+        x = tl.load(x_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
         c = tl.load(c_ptrs, mask=k_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
         
-        # Compute (x - c)^2 for this chunk
-        # x: [BLOCK_N, BLOCK_D], c: [BLOCK_K, BLOCK_D]
-        for i in range(BLOCK_D):
-            if d_start + i < D:
-                xi = x[:, i]  # [BLOCK_N]
-                ci = c[:, i]  # [BLOCK_K]
-                diff = xi[:, None] - ci[None, :]  # [BLOCK_N, BLOCK_K]
-                dist += diff * diff
+        # Accumulate x @ c.T using tl.dot
+        dot_prod += tl.dot(x, tl.trans(c))
+    
+    # Compute distance: ||x||^2 + ||c||^2 - 2 * x @ c.T
+    dist = x_sqnorm[:, None] + c_sqnorm[None, :] - 2.0 * dot_prod
     
     # Store distances
     dist_ptrs = Dist_ptr + n_offsets[:, None] * K + k_offsets[None, :]
@@ -212,13 +218,17 @@ def triton_kmeans(
             x_b = x[b].contiguous().float()  # [N, D]
             c_b = centroids[b].contiguous()  # [K, D]
             
-            # Step 1: Compute distances
+            # Precompute squared norms for efficient distance calculation
+            x_sqnorm = (x_b * x_b).sum(dim=-1).contiguous()  # [N]
+            c_sqnorm = (c_b * c_b).sum(dim=-1).contiguous()  # [K]
+            
+            # Step 1: Compute distances using ||x-c||^2 = ||x||^2 + ||c||^2 - 2*x@c.T
             dist = torch.zeros(N, K, dtype=torch.float32, device=device)
             grid_n = triton.cdiv(N, BLOCK_N)
             grid_k = triton.cdiv(K, BLOCK_K)
             
             _pairwise_distance_kernel[(grid_n, grid_k)](
-                x_b, c_b, dist,
+                x_b, c_b, x_sqnorm, c_sqnorm, dist,
                 N, K, D,
                 BLOCK_N, BLOCK_K, BLOCK_D,
             )
@@ -503,7 +513,8 @@ def _flash_attn_fwd_kernel(
         p = tl.exp(s - m_new[:, None])
         
         l_acc = alpha * l_acc + tl.sum(p, axis=1)
-        o_acc = alpha[:, None] * o_acc + tl.dot(p.to(tl.float16), v)
+        # Both p and v must have same dtype for tl.dot
+        o_acc = alpha[:, None] * o_acc + tl.dot(p.to(v.dtype), v)
         m_acc = m_new
     
     # Normalize output
