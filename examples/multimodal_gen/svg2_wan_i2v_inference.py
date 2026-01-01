@@ -47,10 +47,18 @@ def parse_args():
         required=True,
         help="Path to the input image for I2V"
     )
+    # Default negative prompt from Sparse-VideoGen
+    DEFAULT_NEGATIVE_PROMPT = (
+        "Bright tones, overexposed, static, blurred details, subtitles, style, works, "
+        "paintings, images, static, overall gray, worst quality, low quality, "
+        "JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, "
+        "poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, "
+        "still picture, messy background, three legs, many people in the background, walking backwards"
+    )
     parser.add_argument(
         "--negative-prompt",
         type=str,
-        default="",
+        default=DEFAULT_NEGATIVE_PROMPT,
         help="Negative prompt to guide generation"
     )
     
