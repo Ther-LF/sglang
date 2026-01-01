@@ -168,6 +168,7 @@ def triton_kmeans(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     GPU-accelerated K-Means clustering using Triton.
+    Optimized to minimize memory allocations.
     
     Args:
         x: Input tensor [B, N, D] or [N, D]
@@ -192,14 +193,19 @@ def triton_kmeans(
     device = x.device
     dtype = x.dtype
     
-    # Flatten batch dimension for simpler kernel dispatch
+    # Flatten batch dimension for simpler kernel dispatch if possible, 
+    # but here we process batch-by-batch or use a batched kernel.
+    # Current kernels are unbatched (process one set of points).
+    # To reduce python overhead, ideally we would make kernels batched, 
+    # but for now let's optimize memory allocation.
+    
     x_flat = x.reshape(B * N, D).contiguous()
     
-    # Initialize centroids (random or provided)
+    # Initialize centroids
     if init_centroids is not None:
         centroids = init_centroids.reshape(B * K, D).clone().float()
     else:
-        # Random initialization: sample K points from each batch
+        # Random initialization
         indices = torch.randint(0, N, (B, K), device=device)
         batch_offset = torch.arange(B, device=device)[:, None] * N
         flat_indices = (batch_offset + indices).flatten()
@@ -208,56 +214,68 @@ def triton_kmeans(
     centroids = centroids.reshape(B, K, D)
     labels = torch.zeros(B, N, dtype=torch.int32, device=device)
     
+    # Pre-allocate buffers for the loop to avoid malloc overhead
+    dist_buffer = torch.empty(N, K, dtype=torch.float32, device=device)
+    centroid_sum_buffer = torch.empty(K, D, dtype=torch.float32, device=device)
+    centroid_count_buffer = torch.empty(K, dtype=torch.int32, device=device)
+    x_sqnorm_buffer = torch.empty(N, dtype=torch.float32, device=device)
+    c_sqnorm_buffer = torch.empty(K, dtype=torch.float32, device=device)
+    
     # Kernel config
-    BLOCK_N = 32
-    BLOCK_K = min(32, K)
-    BLOCK_D = min(64, D)
+    BLOCK_N = 128 # Increased from 32 for better occupancy
+    BLOCK_K = min(128, K) # Increased
+    BLOCK_D = min(128, triton.next_power_of_2(D))
+    
+    grid_n = triton.cdiv(N, BLOCK_N)
+    grid_k = triton.cdiv(K, BLOCK_K)
     
     for iteration in range(max_iters):
         # Process each batch
+        # TODO: Ideally fuse batch dimension into kernel grid to avoid Python loop
         for b in range(B):
-            x_b = x[b].contiguous().float()  # [N, D]
-            c_b = centroids[b].contiguous()  # [K, D]
+            x_b = x[b] # [N, D]
+            c_b = centroids[b] # [K, D]
             
-            # Precompute squared norms for efficient distance calculation
-            x_sqnorm = (x_b * x_b).sum(dim=-1).contiguous()  # [N]
-            c_sqnorm = (c_b * c_b).sum(dim=-1).contiguous()  # [K]
+            # Precompute squared norms
+            # torch.sum is fast and optimized
+            torch.sum(x_b * x_b, dim=-1, out=x_sqnorm_buffer)
+            torch.sum(c_b * c_b, dim=-1, out=c_sqnorm_buffer)
             
-            # Step 1: Compute distances using ||x-c||^2 = ||x||^2 + ||c||^2 - 2*x@c.T
-            dist = torch.zeros(N, K, dtype=torch.float32, device=device)
-            grid_n = triton.cdiv(N, BLOCK_N)
-            grid_k = triton.cdiv(K, BLOCK_K)
-            
+            # Step 1: Compute distances
             _pairwise_distance_kernel[(grid_n, grid_k)](
-                x_b, c_b, x_sqnorm, c_sqnorm, dist,
+                x_b, c_b, x_sqnorm_buffer, c_sqnorm_buffer, dist_buffer,
                 N, K, D,
                 BLOCK_N, BLOCK_K, BLOCK_D,
             )
             
             # Step 2: Assign clusters
             _assign_clusters_kernel[(grid_n,)](
-                dist, labels[b],
+                dist_buffer, labels[b],
                 N, K, BLOCK_N,
             )
             
             # Step 3: Update centroids
-            centroid_sum = torch.zeros(K, D, dtype=torch.float32, device=device)
-            centroid_count = torch.zeros(K, dtype=torch.int32, device=device)
+            # Zero out buffers
+            centroid_sum_buffer.zero_()
+            centroid_count_buffer.zero_()
             
             _update_centroids_kernel[(N,)](
-                x_b, labels[b], centroid_sum, centroid_count,
+                x_b, labels[b], centroid_sum_buffer, centroid_count_buffer,
                 N, D, K, BLOCK_D,
             )
             
+            # Update centroids
             # Avoid division by zero
-            centroid_count = centroid_count.clamp(min=1)
-            centroids[b] = centroid_sum / centroid_count[:, None]
+            centroid_count_safe = centroid_count_buffer.clamp(min=1)
+            centroids[b] = centroid_sum_buffer / centroid_count_safe[:, None]
     
-    # Compute cluster sizes
+    # Compute final cluster sizes
     cluster_sizes = torch.zeros(B, K, dtype=torch.int32, device=device)
     for b in range(B):
-        for k in range(K):
-            cluster_sizes[b, k] = (labels[b] == k).sum()
+        # Using bincount is faster than python loop
+        # labels[b] is [N], values in [0, K-1]
+        counts = torch.bincount(labels[b].long(), minlength=K)
+        cluster_sizes[b] = counts.to(torch.int32)
     
     if not is_batched:
         labels = labels.squeeze(0)
@@ -690,8 +708,8 @@ def block_sparse_attention(
     BLOCK_D = triton.next_power_of_2(D)
     
     if S <= 512:
-        BLOCK_M = 64
-        BLOCK_N = 64
+        BLOCK_M = 32
+        BLOCK_N = 32
     elif S <= 1024:
         BLOCK_M = 64
         BLOCK_N = 64
@@ -725,8 +743,8 @@ def block_sparse_attention(
         S,
         D,
         scale,
-        QC_NUM=qc_num,
-        KC_NUM=kc_num,
+        qc_num,  # Pass variable, NOT constant
+        kc_num,  # Pass variable, NOT constant
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
