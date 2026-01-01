@@ -18,8 +18,18 @@ infer_step=40
 # Model
 model_id=${MODEL_ID:-"Wan-AI/Wan2.1-T2V-14B-720P-Diffusers"}
 
-# Prompt
-prompt=${PROMPT:-"A curious raccoon peers through a vibrant field of yellow sunflowers, its eyes wide with interest."}
+# Sparse-VideoGen base path (for reading example prompts)
+SVG_BASE=${SVG_BASE:-"/root/Sparse-VideoGen"}
+
+# Default prompt ID
+prompt_id=${PROMPT_ID:-2}
+
+# Try to read prompt from file, or use default
+if [ -f "${SVG_BASE}/examples/${prompt_id}/prompt.txt" ]; then
+    prompt=$(cat "${SVG_BASE}/examples/${prompt_id}/prompt.txt")
+else
+    prompt=${PROMPT:-"A curious raccoon peers through a vibrant field of yellow sunflowers, its eyes wide with interest."}
+fi
 
 # Output
 output_dir="outputs/svg2/wan_t2v"

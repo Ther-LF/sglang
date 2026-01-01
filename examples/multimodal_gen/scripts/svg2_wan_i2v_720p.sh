@@ -35,23 +35,27 @@ kmeans_iter_step=2
 
 # ===== Input Settings =====
 
+# Sparse-VideoGen base path
+SVG_BASE=${SVG_BASE:-"/root/Sparse-VideoGen"}
+
 # Default prompt (can be overridden by environment variable)
 prompt_id=${PROMPT_ID:-1}
 
 # Try to read prompt from file, or use default
-if [ -f "examples/${prompt_id}/prompt.txt" ]; then
-    prompt=$(cat "examples/${prompt_id}/prompt.txt")
+if [ -f "${SVG_BASE}/examples/${prompt_id}/prompt.txt" ]; then
+    prompt=$(cat "${SVG_BASE}/examples/${prompt_id}/prompt.txt")
 else
     prompt=${PROMPT:-"A curious raccoon explores a sunlit forest clearing, its eyes bright with wonder."}
 fi
 
 # Input image path
-image_path=${IMAGE_PATH:-"examples/${prompt_id}/image.jpg"}
+image_path=${IMAGE_PATH:-"${SVG_BASE}/examples/${prompt_id}/image.jpg"}
 
 # Check if image exists
 if [ ! -f "$image_path" ]; then
     echo "Warning: Image not found at $image_path"
     echo "Please provide a valid image path via IMAGE_PATH environment variable"
+    echo "Or set SVG_BASE to point to your Sparse-VideoGen directory"
     exit 1
 fi
 
