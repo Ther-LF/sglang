@@ -16,7 +16,7 @@ resolution="720p"
 infer_step=40
 
 # Model
-model_id=${MODEL_ID:-"Wan-AI/Wan2.1-T2V-14B-720P-Diffusers"}
+model_id=${MODEL_ID:-"/mnt/gemininjceph3/geminicephfs/mmsearch-luban-universal/group_libra/user_spanaluo/opensource_model/Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"}
 
 # Sparse-VideoGen base path (for reading example prompts)
 SVG_BASE=${SVG_BASE:-"/root/Sparse-VideoGen"}

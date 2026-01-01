@@ -74,7 +74,7 @@ output_feature="${video_cfg}/${dense_attention_cfg}/${centroid_cfg}/${kmeans_cfg
 num_gpus=${NUM_GPUS:-1}
 
 # ===== Model Settings =====
-model_id=${MODEL_ID:-"Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"}
+model_id=${MODEL_ID:-"/mnt/gemininjceph3/geminicephfs/mmsearch-luban-universal/group_libra/user_spanaluo/opensource_model/Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"}
 
 # ===== Run Inference =====
 
