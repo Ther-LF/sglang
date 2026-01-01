@@ -15,6 +15,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -650,6 +651,183 @@ def _compute_block_boundaries(cluster_sizes: torch.Tensor) -> torch.Tensor:
     return block_starts
 
 
+@triton.jit
+def _gather_selected_kv_kernel(
+    # Input tensors
+    K_ptr, V_ptr,
+    # Output tensors (gathered)
+    K_out_ptr, V_out_ptr,
+    # Indices
+    K_starts_ptr,  # [Kk+1] block boundaries for this bh
+    selected_blocks_ptr,  # [num_selected] indices of selected blocks
+    # Dimensions
+    num_selected,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    Gather selected key/value blocks into contiguous memory.
+    Grid: (num_tokens_to_gather,)
+    """
+    token_idx = tl.program_id(0)
+    
+    # Find which selected block this token belongs to
+    cumsum = 0
+    block_local_idx = 0
+    selected_block_idx = 0
+    
+    for i in range(num_selected):
+        ki = tl.load(selected_blocks_ptr + i)
+        k_start = tl.load(K_starts_ptr + ki)
+        k_end = tl.load(K_starts_ptr + ki + 1)
+        block_len = k_end - k_start
+        
+        if token_idx >= cumsum and token_idx < cumsum + block_len:
+            selected_block_idx = i
+            block_local_idx = token_idx - cumsum
+            # Source index in original K/V
+            src_idx = k_start + block_local_idx
+            
+            # Copy K
+            d_range = tl.arange(0, BLOCK_D)
+            mask = d_range < D
+            k_val = tl.load(K_ptr + src_idx * D + d_range, mask=mask, other=0.0)
+            tl.store(K_out_ptr + token_idx * D + d_range, k_val, mask=mask)
+            
+            # Copy V
+            v_val = tl.load(V_ptr + src_idx * D + d_range, mask=mask, other=0.0)
+            tl.store(V_out_ptr + token_idx * D + d_range, v_val, mask=mask)
+            return
+        
+        cumsum += block_len
+
+
+@triton.jit
+def _flash_attn_fwd_inner_kernel(
+    # Pointers
+    Q_ptr, K_ptr, V_ptr, O_ptr,
+    # Dimensions
+    M, N, D: tl.constexpr,  # M = query length, N = key length
+    stride_qm, stride_kn, stride_vn, stride_om,
+    # Scale
+    scale,
+    # Block sizes
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    Standard FlashAttention forward kernel for a single (batch, head) pair.
+    Used after gathering selected K/V tokens.
+    
+    Grid: (ceil(M / BLOCK_M),)
+    """
+    pid_m = tl.program_id(0)
+    
+    # Query block range
+    m_start = pid_m * BLOCK_M
+    m_offsets = m_start + tl.arange(0, BLOCK_M)
+    m_mask = m_offsets < M
+    
+    # Load query block [BLOCK_M, D]
+    d_range = tl.arange(0, BLOCK_D)
+    d_mask = d_range < D
+    
+    q_ptrs = Q_ptr + m_offsets[:, None] * stride_qm + d_range[None, :]
+    q = tl.load(q_ptrs, mask=m_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+    
+    # Initialize online softmax accumulators
+    m_i = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    o_i = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+    
+    # Iterate over key blocks
+    for n_start in range(0, N, BLOCK_N):
+        n_offsets = n_start + tl.arange(0, BLOCK_N)
+        n_mask = n_offsets < N
+        
+        # Load key block [BLOCK_N, D]
+        k_ptrs = K_ptr + n_offsets[:, None] * stride_kn + d_range[None, :]
+        k = tl.load(k_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+        
+        # Compute attention scores [BLOCK_M, BLOCK_N]
+        # q: [BLOCK_M, D], k: [BLOCK_N, D] -> scores: [BLOCK_M, BLOCK_N]
+        scores = tl.dot(q, tl.trans(k)) * scale
+        
+        # Mask out invalid positions
+        scores = tl.where(
+            m_mask[:, None] & n_mask[None, :],
+            scores,
+            float('-inf')
+        )
+        
+        # Online softmax update
+        m_ij = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new[:, None])
+        
+        l_ij = tl.sum(p, axis=1)
+        l_new = alpha * l_i + l_ij
+        
+        # Load value block [BLOCK_N, D]
+        v_ptrs = V_ptr + n_offsets[:, None] * stride_vn + d_range[None, :]
+        v = tl.load(v_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+        
+        # Update output accumulator
+        o_i = alpha[:, None] * o_i + tl.dot(p.to(v.dtype), v)
+        
+        m_i = m_new
+        l_i = l_new
+    
+    # Normalize
+    o_i = o_i / l_i[:, None]
+    
+    # Store output
+    o_ptrs = O_ptr + m_offsets[:, None] * stride_om + d_range[None, :]
+    tl.store(o_ptrs, o_i.to(tl.float16), mask=m_mask[:, None] & d_mask[None, :])
+
+
+def _triton_block_attention(
+    q_block: torch.Tensor,  # [q_len, D]
+    k_selected: torch.Tensor,  # [k_len, D]
+    v_selected: torch.Tensor,  # [k_len, D]
+    scale: float,
+) -> torch.Tensor:
+    """
+    Compute attention for one query block with selected K/V using Triton.
+    """
+    M, D = q_block.shape
+    N = k_selected.shape[0]
+    
+    if M == 0 or N == 0:
+        return torch.zeros_like(q_block)
+    
+    output = torch.zeros_like(q_block)
+    
+    BLOCK_M = min(64, triton.next_power_of_2(M))
+    BLOCK_N = min(64, triton.next_power_of_2(N))
+    BLOCK_D = triton.next_power_of_2(D)
+    
+    grid = (triton.cdiv(M, BLOCK_M),)
+    
+    _flash_attn_fwd_inner_kernel[grid](
+        q_block, k_selected, v_selected, output,
+        M, N, D,
+        D,  # stride_qm
+        D,  # stride_kn
+        D,  # stride_vn
+        D,  # stride_om
+        scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=BLOCK_D,
+    )
+    
+    return output
+
+
 def block_sparse_attention(
     q: torch.Tensor,           # [B, H, S, D]
     k: torch.Tensor,           # [B, H, S, D]
@@ -661,11 +839,16 @@ def block_sparse_attention(
     """
     Block sparse attention with variable block sizes.
     
-    Uses chunked computation to avoid creating full S×S mask.
-    Processes each query block separately with only the selected key blocks.
-    Uses SDPA for each block pair to leverage FlashAttention.
+    Strategy: For each query block, gather selected K/V into contiguous memory,
+    then use a Triton FlashAttention kernel. 
     
-    Memory: O(max_q_block * max_k_block) instead of O(S^2)
+    Performance notes:
+    - Still has O(BH * Kq) Python iterations, but each iteration is fast
+    - GPU-CPU sync happens once per BH (not per iteration)
+    - Triton FlashAttention kernel for actual attention computation
+    - True O(1) sparse attention requires flashinfer integration
+    
+    Memory: O(max_q_block * selected_k_tokens) instead of O(S^2)
     """
     B, H, S, D = q.shape
     device = q.device
@@ -676,75 +859,74 @@ def block_sparse_attention(
     Kk = k_cluster_sizes.shape[-1]
     
     # Reshape for processing
-    q_flat = q.reshape(B * H, S, D)
-    k_flat = k.reshape(B * H, S, D)
-    v_flat = v.reshape(B * H, S, D)
+    q_flat = q.reshape(B * H, S, D).contiguous()
+    k_flat = k.reshape(B * H, S, D).contiguous()
+    v_flat = v.reshape(B * H, S, D).contiguous()
     block_mask_flat = block_mask.reshape(B * H, Kq, Kk)
     q_sizes_flat = q_cluster_sizes.reshape(B * H, Kq).to(torch.int64)
     k_sizes_flat = k_cluster_sizes.reshape(B * H, Kk).to(torch.int64)
     
-    # Compute block boundaries
+    # Compute block boundaries on GPU
     q_starts = _compute_block_boundaries(q_sizes_flat)  # [BH, Kq+1]
     k_starts = _compute_block_boundaries(k_sizes_flat)  # [BH, Kk+1]
+    
+    # ========== KEY OPTIMIZATION: Single GPU->CPU sync for all boundaries ==========
+    # Transfer all block boundaries to CPU at once (one sync instead of many)
+    q_starts_cpu = q_starts.cpu().numpy()  # [BH, Kq+1]
+    k_starts_cpu = k_starts.cpu().numpy()  # [BH, Kk+1]
+    # Also transfer mask to CPU for fast iteration
+    mask_cpu = block_mask_flat.cpu().numpy()  # [BH, Kq, Kk]
     
     # Output tensor
     output = torch.zeros_like(q_flat)
     
-    # Process each (batch, head) separately
-    for bh in range(B * H):
+    BH = B * H
+    
+    # Process each (batch, head) 
+    for bh in range(BH):
         q_bh = q_flat[bh]  # [S, D]
         k_bh = k_flat[bh]  # [S, D]
         v_bh = v_flat[bh]  # [S, D]
-        mask_bh = block_mask_flat[bh]  # [Kq, Kk]
         
-        q_block_starts = q_starts[bh]  # [Kq+1]
-        k_block_starts = k_starts[bh]  # [Kk+1]
+        # Use pre-transferred CPU arrays (no sync here)
+        q_starts_bh = q_starts_cpu[bh]  # [Kq+1]
+        k_starts_bh = k_starts_cpu[bh]  # [Kk+1]
+        mask_bh = mask_cpu[bh]  # [Kq, Kk]
         
-        # For each query block
         for qi in range(Kq):
-            q_start = q_block_starts[qi].item()
-            q_end = q_block_starts[qi + 1].item()
+            q_start = int(q_starts_bh[qi])
+            q_end = int(q_starts_bh[qi + 1])
             if q_start >= q_end:
                 continue
             
             q_block = q_bh[q_start:q_end]  # [q_size, D]
             
-            # Find which key blocks this query block attends to
-            k_block_indices = mask_bh[qi].nonzero(as_tuple=True)[0]
+            # Find selected key blocks from CPU mask
+            k_block_indices = mask_bh[qi].nonzero()[0]
             
             if len(k_block_indices) == 0:
-                # No key blocks to attend to, output zeros
                 continue
             
-            # Gather all selected key/value tokens
-            k_blocks = []
-            v_blocks = []
+            # Build k indices list (CPU operations, fast)
+            k_indices_list = []
             for ki in k_block_indices:
-                k_start = k_block_starts[ki].item()
-                k_end = k_block_starts[ki + 1].item()
+                k_start = int(k_starts_bh[ki])
+                k_end = int(k_starts_bh[ki + 1])
                 if k_start < k_end:
-                    k_blocks.append(k_bh[k_start:k_end])
-                    v_blocks.append(v_bh[k_start:k_end])
+                    k_indices_list.extend(range(k_start, k_end))
             
-            if len(k_blocks) == 0:
+            if len(k_indices_list) == 0:
                 continue
             
-            k_selected = torch.cat(k_blocks, dim=0)  # [total_k_size, D]
-            v_selected = torch.cat(v_blocks, dim=0)  # [total_k_size, D]
+            # Single GPU operation to gather K/V
+            k_indices = torch.tensor(k_indices_list, device=device, dtype=torch.long)
+            k_selected = k_bh[k_indices]  # [total_k, D]
+            v_selected = v_bh[k_indices]  # [total_k, D]
             
-            # Use SDPA for efficient attention (will use FlashAttention if available)
-            # Reshape to [1, 1, q_size, D] for SDPA
-            q_block_4d = q_block.unsqueeze(0).unsqueeze(0)
-            k_selected_4d = k_selected.unsqueeze(0).unsqueeze(0)
-            v_selected_4d = v_selected.unsqueeze(0).unsqueeze(0)
+            # Use Triton FlashAttention for this block
+            out_block = _triton_block_attention(q_block, k_selected, v_selected, scale)
             
-            out_block = torch.nn.functional.scaled_dot_product_attention(
-                q_block_4d, k_selected_4d, v_selected_4d,
-                dropout_p=0.0,
-                scale=scale,
-            )
-            
-            output[bh, q_start:q_end] = out_block.squeeze(0).squeeze(0)
+            output[bh, q_start:q_end] = out_block
     
     return output.reshape(B, H, S, D)
 
