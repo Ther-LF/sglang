@@ -633,54 +633,21 @@ def _gather_kv_triton(k: torch.Tensor, v: torch.Tensor, indices: torch.Tensor) -
     return k_out, v_out
 
 
-def _expand_block_mask_to_token_mask(
-    block_mask: torch.Tensor,      # [B, H, Kq, Kk]
-    q_cluster_sizes: torch.Tensor,  # [B, H, Kq]
-    k_cluster_sizes: torch.Tensor,  # [B, H, Kk]
-    S: int,
-) -> torch.Tensor:
+def _compute_block_boundaries(cluster_sizes: torch.Tensor) -> torch.Tensor:
     """
-    Expand block-level mask to token-level mask.
+    Compute block start indices from cluster sizes.
     
-    Vectorized implementation - no Python loops.
-    Uses broadcasting and repeat_interleave for efficiency.
+    Args:
+        cluster_sizes: [BH, K] cluster sizes
+    
+    Returns:
+        block_starts: [BH, K+1] cumulative start indices
     """
-    B, H, Kq, Kk = block_mask.shape
-    device = block_mask.device
-    
-    # Flatten B, H dimensions for vectorized processing
-    block_mask_flat = block_mask.reshape(B * H, Kq, Kk)  # [BH, Kq, Kk]
-    q_sizes_flat = q_cluster_sizes.reshape(B * H, Kq).to(torch.int64)  # [BH, Kq]
-    k_sizes_flat = k_cluster_sizes.reshape(B * H, Kk).to(torch.int64)  # [BH, Kk]
-    
-    # Create output tensor
-    token_mask = torch.zeros(B * H, S, S, dtype=torch.bool, device=device)
-    
-    # Process in a vectorized manner by creating index mappings
-    # For each position in S, determine which block it belongs to
-    
-    # Create block indices for Q and K
-    q_block_starts = torch.zeros(B * H, Kq + 1, dtype=torch.int64, device=device)
-    k_block_starts = torch.zeros(B * H, Kk + 1, dtype=torch.int64, device=device)
-    q_block_starts[:, 1:] = q_sizes_flat.cumsum(dim=-1)
-    k_block_starts[:, 1:] = k_sizes_flat.cumsum(dim=-1)
-    
-    # For each (b*h), expand the mask
-    # This is still a loop but over BH which is typically small (1-32)
-    for bh in range(B * H):
-        q_sizes = q_sizes_flat[bh]
-        k_sizes = k_sizes_flat[bh]
-        mask = block_mask_flat[bh]  # [Kq, Kk]
-        
-        # Expand: repeat each row q_sizes[qi] times, each col k_sizes[ki] times
-        # Step 1: expand columns
-        expanded_k = mask.repeat_interleave(k_sizes, dim=1)  # [Kq, S]
-        # Step 2: expand rows  
-        expanded_qk = expanded_k.repeat_interleave(q_sizes, dim=0)  # [S, S]
-        
-        token_mask[bh] = expanded_qk
-    
-    return token_mask.reshape(B, H, S, S)
+    BH, K = cluster_sizes.shape
+    device = cluster_sizes.device
+    block_starts = torch.zeros(BH, K + 1, dtype=torch.int64, device=device)
+    block_starts[:, 1:] = cluster_sizes.to(torch.int64).cumsum(dim=-1)
+    return block_starts
 
 
 def block_sparse_attention(
@@ -694,76 +661,92 @@ def block_sparse_attention(
     """
     Block sparse attention with variable block sizes.
     
-    Uses masked attention for efficiency - no Python loops over blocks.
-    The block mask is expanded to token-level mask and applied to attention.
+    Uses chunked computation to avoid creating full S×S mask.
+    Processes each query block separately with only the selected key blocks.
+    Uses SDPA for each block pair to leverage FlashAttention.
+    
+    Memory: O(max_q_block * max_k_block) instead of O(S^2)
     """
     B, H, S, D = q.shape
     device = q.device
     dtype = q.dtype
     scale = 1.0 / math.sqrt(D)
     
-    # Expand block mask to token-level mask
-    token_mask = _expand_block_mask_to_token_mask(
-        block_mask, q_cluster_sizes, k_cluster_sizes, S
-    )  # [B, H, S, S]
+    Kq = q_cluster_sizes.shape[-1]
+    Kk = k_cluster_sizes.shape[-1]
     
-    # Compute attention with mask using PyTorch's efficient SDPA
-    # Convert mask: True means attend, False means mask out
-    # SDPA expects: True = masked out (don't attend), so we invert
-    attn_mask = ~token_mask  # [B, H, S, S]
+    # Reshape for processing
+    q_flat = q.reshape(B * H, S, D)
+    k_flat = k.reshape(B * H, S, D)
+    v_flat = v.reshape(B * H, S, D)
+    block_mask_flat = block_mask.reshape(B * H, Kq, Kk)
+    q_sizes_flat = q_cluster_sizes.reshape(B * H, Kq).to(torch.int64)
+    k_sizes_flat = k_cluster_sizes.reshape(B * H, Kk).to(torch.int64)
     
-    # Use scaled_dot_product_attention with mask
-    # Note: attn_mask should be float for additive mask or bool for masking
-    attn_mask_float = torch.where(attn_mask, float('-inf'), 0.0).to(dtype)
+    # Compute block boundaries
+    q_starts = _compute_block_boundaries(q_sizes_flat)  # [BH, Kq+1]
+    k_starts = _compute_block_boundaries(k_sizes_flat)  # [BH, Kk+1]
     
-    # Compute Q @ K^T * scale + mask
-    scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, H, S, S]
-    scores = scores + attn_mask_float
+    # Output tensor
+    output = torch.zeros_like(q_flat)
     
-    # Softmax and apply to V
-    attn_weights = torch.softmax(scores, dim=-1)
-    # Handle all-masked rows (will be nan from softmax)
-    attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+    # Process each (batch, head) separately
+    for bh in range(B * H):
+        q_bh = q_flat[bh]  # [S, D]
+        k_bh = k_flat[bh]  # [S, D]
+        v_bh = v_flat[bh]  # [S, D]
+        mask_bh = block_mask_flat[bh]  # [Kq, Kk]
+        
+        q_block_starts = q_starts[bh]  # [Kq+1]
+        k_block_starts = k_starts[bh]  # [Kk+1]
+        
+        # For each query block
+        for qi in range(Kq):
+            q_start = q_block_starts[qi].item()
+            q_end = q_block_starts[qi + 1].item()
+            if q_start >= q_end:
+                continue
+            
+            q_block = q_bh[q_start:q_end]  # [q_size, D]
+            
+            # Find which key blocks this query block attends to
+            k_block_indices = mask_bh[qi].nonzero(as_tuple=True)[0]
+            
+            if len(k_block_indices) == 0:
+                # No key blocks to attend to, output zeros
+                continue
+            
+            # Gather all selected key/value tokens
+            k_blocks = []
+            v_blocks = []
+            for ki in k_block_indices:
+                k_start = k_block_starts[ki].item()
+                k_end = k_block_starts[ki + 1].item()
+                if k_start < k_end:
+                    k_blocks.append(k_bh[k_start:k_end])
+                    v_blocks.append(v_bh[k_start:k_end])
+            
+            if len(k_blocks) == 0:
+                continue
+            
+            k_selected = torch.cat(k_blocks, dim=0)  # [total_k_size, D]
+            v_selected = torch.cat(v_blocks, dim=0)  # [total_k_size, D]
+            
+            # Use SDPA for efficient attention (will use FlashAttention if available)
+            # Reshape to [1, 1, q_size, D] for SDPA
+            q_block_4d = q_block.unsqueeze(0).unsqueeze(0)
+            k_selected_4d = k_selected.unsqueeze(0).unsqueeze(0)
+            v_selected_4d = v_selected.unsqueeze(0).unsqueeze(0)
+            
+            out_block = torch.nn.functional.scaled_dot_product_attention(
+                q_block_4d, k_selected_4d, v_selected_4d,
+                dropout_p=0.0,
+                scale=scale,
+            )
+            
+            output[bh, q_start:q_end] = out_block.squeeze(0).squeeze(0)
     
-    output = torch.matmul(attn_weights, v)  # [B, H, S, D]
-    
-    return output
-
-
-def block_sparse_attention_v2(
-    q: torch.Tensor,           # [B, H, S, D]
-    k: torch.Tensor,           # [B, H, S, D]
-    v: torch.Tensor,           # [B, H, S, D]
-    block_mask: torch.Tensor,  # [B, H, Kq, Kk]
-    q_cluster_sizes: torch.Tensor,  # [B, H, Kq]
-    k_cluster_sizes: torch.Tensor,  # [B, H, Kk]
-) -> torch.Tensor:
-    """
-    Block sparse attention using PyTorch's SDPA (most efficient for modern GPUs).
-    
-    Uses F.scaled_dot_product_attention with custom mask.
-    """
-    B, H, S, D = q.shape
-    device = q.device
-    dtype = q.dtype
-    
-    # Expand block mask to token-level mask
-    token_mask = _expand_block_mask_to_token_mask(
-        block_mask, q_cluster_sizes, k_cluster_sizes, S
-    )  # [B, H, S, S]
-    
-    # SDPA uses additive mask (0 = attend, -inf = mask)
-    attn_mask = torch.where(token_mask, 0.0, float('-inf')).to(dtype)
-    
-    # Use PyTorch's optimized SDPA
-    output = torch.nn.functional.scaled_dot_product_attention(
-        q, k, v,
-        attn_mask=attn_mask,
-        dropout_p=0.0,
-        scale=1.0 / math.sqrt(D),
-    )
-    
-    return output
+    return output.reshape(B, H, S, D)
 
 
 # ============================================================================
