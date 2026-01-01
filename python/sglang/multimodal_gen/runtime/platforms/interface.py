@@ -34,6 +34,7 @@ class AttentionBackendEnum(enum.Enum):
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
     NO_ATTENTION = enum.auto()
+    SVG2_SPARSE_ATTN = enum.auto()  # SVG2 Semantic-Aware Permutation Attention
 
     def __str__(self):
         return self.name.lower()
