@@ -209,17 +209,19 @@ def benchmark_kmeans(svg2_components: dict, device: str = "cuda"):
         (1, 4096, 64, 32),
         (1, 8192, 64, 64),
         (2, 4096, 128, 64),
+        # Larger config
+        (1, 16384, 128, 128),
     ]
     
     for B, N, D, K in configs:
         x = torch.randn(B, N, D, device=device, dtype=torch.float16)
         
-        # SVG2 K-Means
+        # SVG2 K-Means (Triton)
         svg2_time = benchmark_fn(
             lambda: svg2_components['triton_kmeans'](x, K, max_iters=5)
         )
         
-        # Torch K-Means
+        # Torch K-Means (Standard loop implementation)
         torch_time = benchmark_fn(
             lambda: torch_kmeans(x, K, max_iters=5)
         )
@@ -237,18 +239,22 @@ def benchmark_permutation(svg2_components: dict, device: str = "cuda"):
         (1, 8, 1024, 64),
         (1, 16, 4096, 64),
         (1, 24, 8192, 128),
+        # Larger config
+        (1, 16, 16384, 128),
     ]
     
     for B, H, S, D in configs:
         x = torch.randn(B, H, S, D, device=device, dtype=torch.float16)
         labels = torch.randint(0, 32, (B * H, S), device=device)
         
-        # SVG2 Permutation
+        # SVG2 Permutation (Triton)
+        # Includes both permute and sort inside if needed, but permute_by_labels does sort internally
         svg2_time = benchmark_fn(
             lambda: svg2_components['permute_by_labels'](x, labels)
         )
         
         # Torch Permutation (argsort + gather)
+        # This is the standard way to do it in PyTorch
         def torch_permute():
             sorted_indices = torch.argsort(labels, dim=-1)
             x_flat = x.reshape(B * H, S, D)
@@ -270,6 +276,8 @@ def benchmark_block_sparse_attention(svg2_components: dict, device: str = "cuda"
         (1, 8, 1024, 64, 16, 16, 0.5),
         (1, 16, 4096, 64, 32, 32, 0.5),
         (1, 16, 4096, 64, 32, 32, 0.7),
+        # Larger config
+        (1, 16, 8192, 128, 64, 64, 0.8),
     ]
     
     for B, H, S, D, Kq, Kk, sparsity in configs:
@@ -288,14 +296,14 @@ def benchmark_block_sparse_attention(svg2_components: dict, device: str = "cuda"
         for i in range(min(Kq, Kk)):
             block_mask[:, :, i, i] = True
         
-        # SVG2 Block Sparse Attention
+        # SVG2 Block Sparse Attention (Triton)
         svg2_time = benchmark_fn(
             lambda: svg2_components['block_sparse_attention'](
                 q, k, v, block_mask, q_cluster_sizes, k_cluster_sizes
             )
         )
         
-        # Torch Dense Attention (for comparison)
+        # Torch Dense Attention (for comparison baseline)
         q_t = q.transpose(1, 2).contiguous()  # [B, S, H, D]
         k_t = k.transpose(1, 2).contiguous()
         v_t = v.transpose(1, 2).contiguous()
@@ -305,7 +313,7 @@ def benchmark_block_sparse_attention(svg2_components: dict, device: str = "cuda"
         )
         
         actual_sparsity = 1 - block_mask.float().mean().item()
-        name = f"S={S}, K={Kq}, sparsity={actual_sparsity:.0%}"
+        name = f"S={S}, K={Kq}, D={D}, sparsity={actual_sparsity:.0%}"
         print_comparison(name, svg2_time, torch_time)
 
 
@@ -324,10 +332,10 @@ def benchmark_full_attention(
     print_header("Full Attention Benchmark: SVG2 vs Torch")
     
     if seq_lengths is None:
-        seq_lengths = [1024, 2048, 4096, 8192]
+        seq_lengths = [1024, 2048, 4096, 8192, 16384]
     
     if top_p_values is None:
-        top_p_values = [0.3, 0.5, 0.7]
+        top_p_values = [0.3, 0.5, 0.7, 0.9]
     
     B, H, D = 1, 16, 64
     num_clusters = 64
@@ -344,40 +352,50 @@ def benchmark_full_attention(
         v = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
         
         # Torch Dense Attention
-        torch_dense_time = benchmark_fn(
-            lambda: torch_dense_attention(q, k, v)
-        )
+        try:
+            torch_dense_time = benchmark_fn(
+                lambda: torch_dense_attention(q, k, v)
+            )
+        except RuntimeError: # OOM
+            torch_dense_time = float('inf')
         
-        # Torch SDPA
+        # Torch SDPA (FlashAttention if available)
         torch_sdpa_time = benchmark_fn(
             lambda: torch_sdpa_attention(q, k, v)
         )
         
         print(f"    {'Method':35s} | {'Time (ms)':>12s} | {'vs Dense':>12s} | {'vs SDPA':>12s}")
         print("    " + "-" * 75)
-        print(f"    {'Torch Dense':35s} | {torch_dense_time:12.2f} | {'1.00x':>12s} | {torch_dense_time/torch_sdpa_time:.2f}x slower")
+        
+        dense_str = f"{torch_dense_time:12.2f}" if torch_dense_time != float('inf') else "         OOM"
+        print(f"    {'Torch Dense':35s} | {dense_str} | {'1.00x':>12s} | {torch_dense_time/torch_sdpa_time:.2f}x slower")
         print(f"    {'Torch SDPA':35s} | {torch_sdpa_time:12.2f} | {torch_sdpa_time/torch_dense_time:.2f}x faster | {'1.00x':>12s}")
         
         # SVG2 with different sparsity levels
         for top_p in top_p_values:
+            # Scale clusters with sequence length to maintain reasonable block sizes
+            scaled_clusters = max(16, S // 64) # e.g. 1024->16, 4096->64, 16384->256
+            
             svg2_time = benchmark_fn(
-                lambda tp=top_p: svg2_components['svg2_attention_forward'](
+                lambda tp=top_p, nc=scaled_clusters: svg2_components['svg2_attention_forward'](
                     q, k, v,
-                    num_q_clusters=num_clusters,
-                    num_k_clusters=num_clusters,
+                    num_q_clusters=nc,
+                    num_k_clusters=nc,
                     top_p=tp,
                     kmeans_iters=3,
                 )
             )
             
-            vs_dense = torch_dense_time / svg2_time if svg2_time > 0 else 0
+            vs_dense = torch_dense_time / svg2_time if svg2_time > 0 and torch_dense_time != float('inf') else 0
             vs_sdpa = torch_sdpa_time / svg2_time if svg2_time > 0 else 0
             
             vs_dense_str = f"{vs_dense:.2f}x faster" if vs_dense > 1 else f"{1/vs_dense:.2f}x slower"
+            if torch_dense_time == float('inf'): vs_dense_str = "        Inf"
+            
             vs_sdpa_str = f"{vs_sdpa:.2f}x faster" if vs_sdpa > 1 else f"{1/vs_sdpa:.2f}x slower"
             
             sparsity = (1 - top_p) * 100
-            print(f"    {'SVG2 (top_p=' + str(top_p) + f', ~{sparsity:.0f}% sparse)':35s} | {svg2_time:12.2f} | {vs_dense_str:>12s} | {vs_sdpa_str:>12s}")
+            print(f"    {'SVG2 (p=' + str(top_p) + f', K={scaled_clusters})':35s} | {svg2_time:12.2f} | {vs_dense_str:>12s} | {vs_sdpa_str:>12s}")
 
 
 # ============================================================================
@@ -394,6 +412,8 @@ def benchmark_memory(svg2_components: dict, device: str = "cuda"):
         (1, 4096, 16, 64),
         (1, 8192, 16, 64),
         (1, 16384, 16, 64),
+        # Even larger
+        (1, 32768, 16, 64),
     ]
     
     print(f"  {'Config':30s} | {'Dense (MB)':>12s} | {'SVG2 (MB)':>12s} | {'Savings':>12s}")
@@ -403,34 +423,48 @@ def benchmark_memory(svg2_components: dict, device: str = "cuda"):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         
-        q = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
-        k = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
-        v = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
-        
-        # Measure dense attention memory
-        torch.cuda.reset_peak_memory_stats()
-        _ = torch_dense_attention(q, k, v)
-        torch.cuda.synchronize()
-        dense_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
-        
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        
-        # Measure SVG2 memory
-        _ = svg2_components['svg2_attention_forward'](
-            q, k, v,
-            num_q_clusters=64,
-            num_k_clusters=64,
-            top_p=0.5,
-            kmeans_iters=3,
-        )
-        torch.cuda.synchronize()
-        svg2_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
-        
-        savings = (1 - svg2_memory / dense_memory) * 100 if dense_memory > 0 else 0
-        
-        name = f"B={B}, S={S}, H={H}, D={D}"
-        print(f"  {name:30s} | {dense_memory:12.1f} | {svg2_memory:12.1f} | {savings:11.1f}%")
+        try:
+            q = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
+            k = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
+            v = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
+            
+            # Measure dense attention memory
+            torch.cuda.reset_peak_memory_stats()
+            try:
+                _ = torch_dense_attention(q, k, v)
+                torch.cuda.synchronize()
+                dense_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
+            except RuntimeError:
+                dense_memory = float('inf')
+            
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            
+            # Measure SVG2 memory
+            scaled_clusters = max(16, S // 64)
+            _ = svg2_components['svg2_attention_forward'](
+                q, k, v,
+                num_q_clusters=scaled_clusters,
+                num_k_clusters=scaled_clusters,
+                top_p=0.5,
+                kmeans_iters=3,
+            )
+            torch.cuda.synchronize()
+            svg2_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
+            
+            if dense_memory != float('inf'):
+                savings = (1 - svg2_memory / dense_memory) * 100 if dense_memory > 0 else 0
+                savings_str = f"{savings:10.1f}%"
+                dense_str = f"{dense_memory:12.1f}"
+            else:
+                savings_str = "       N/A"
+                dense_str = "         OOM"
+            
+            name = f"B={B}, S={S}, H={H}, D={D}"
+            print(f"  {name:30s} | {dense_str} | {svg2_memory:12.1f} | {savings_str}")
+            
+        except RuntimeError as e:
+             print(f"  B={B}, S={S}...             |        Error |        Error | Error: {e}")
 
 
 # ============================================================================
@@ -443,7 +477,7 @@ def benchmark_scalability(svg2_components: dict, device: str = "cuda"):
     print_header("Scalability Benchmark (Time vs Sequence Length)")
     
     B, H, D = 1, 16, 64
-    seq_lengths = [512, 1024, 2048, 4096, 8192, 16384]
+    seq_lengths = [512, 1024, 2048, 4096, 8192, 16384, 32768]
     
     print(f"\n  Config: B={B}, H={H}, D={D}")
     print(f"  {'Seq Len':>10s} | {'Dense (ms)':>12s} | {'SDPA (ms)':>12s} | {'SVG2 (ms)':>12s} | {'SVG2 Speedup':>14s}")
@@ -462,26 +496,31 @@ def benchmark_scalability(svg2_components: dict, device: str = "cuda"):
                 dense_time = float('inf')
             
             # Torch SDPA
-            sdpa_time = benchmark_fn(lambda: torch_sdpa_attention(q, k, v), repeat=5)
+            try:
+                sdpa_time = benchmark_fn(lambda: torch_sdpa_attention(q, k, v), repeat=5)
+            except RuntimeError:
+                sdpa_time = float('inf')
             
             # SVG2
+            scaled_clusters = max(16, S // 64)
             svg2_time = benchmark_fn(
                 lambda: svg2_components['svg2_attention_forward'](
                     q, k, v,
-                    num_q_clusters=min(64, S // 16),
-                    num_k_clusters=min(64, S // 16),
+                    num_q_clusters=scaled_clusters,
+                    num_k_clusters=scaled_clusters,
                     top_p=0.5,
                     kmeans_iters=3,
                 ),
                 repeat=5
             )
             
-            speedup = sdpa_time / svg2_time if svg2_time > 0 else 0
+            speedup = sdpa_time / svg2_time if svg2_time > 0 and sdpa_time != float('inf') else 0
             speedup_str = f"{speedup:.2f}x vs SDPA"
             
             dense_str = f"{dense_time:.2f}" if dense_time != float('inf') else "OOM"
+            sdpa_str = f"{sdpa_time:.2f}" if sdpa_time != float('inf') else "OOM"
             
-            print(f"  {S:10d} | {dense_str:>12s} | {sdpa_time:12.2f} | {svg2_time:12.2f} | {speedup_str:>14s}")
+            print(f"  {S:10d} | {dense_str:>12s} | {sdpa_str:>12s} | {svg2_time:12.2f} | {speedup_str:>14s}")
             
         except RuntimeError as e:
             print(f"  {S:10d} | Error: {e}")

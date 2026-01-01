@@ -499,8 +499,8 @@ def _dynamic_block_sparse_fwd_kernel(
     S,
     D,
     scale,
-    QC_NUM: tl.constexpr,
-    KC_NUM: tl.constexpr,
+    QC_NUM,
+    KC_NUM,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -565,7 +565,7 @@ def _dynamic_block_sparse_fwd_kernel(
         q_chunk = tl.load(q_ptr, mask=mask_q, other=0.0)  # Shape: [BLOCK_M, BLOCK_D]
 
         # --- Inner loop over K blocks (columns in the block sparse map) ---
-        for k_block_idx in range(KC_NUM):
+        for k_block_idx in range(0, KC_NUM):
             # --- Check dynamic_map: Is this block active? ---
             is_active = tl.load(dmap_ptr + k_block_idx * stride_dmap_kc)
             if is_active:  # Process block only if it's active
