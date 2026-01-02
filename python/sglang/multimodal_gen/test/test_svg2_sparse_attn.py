@@ -459,15 +459,15 @@ class TestFullSVG2Attention:
         k = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
         v = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
         
-        output = svg2_components['svg2_attention_forward'](
-            q, k, v,
-            num_q_clusters=16,
-            num_k_clusters=16,
-            top_p=0.5,
-            kmeans_iters=3,
-        )
-        
-        assert output.shape == q.shape, f"Shape mismatch: {output.shape}"
+    output, _, _ = svg2_components['svg2_attention_forward'](
+        q, k, v,
+        num_q_clusters=16,
+        num_k_clusters=16,
+        top_p=0.5,
+        kmeans_iters=3,
+    )
+
+    assert output.shape == q.shape, f"Shape mismatch: {output.shape}"
 
     @torch.inference_mode()
     def test_forward_no_nan_inf(self, svg2_components, device):
@@ -478,15 +478,15 @@ class TestFullSVG2Attention:
         k = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
         v = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
         
-        output = svg2_components['svg2_attention_forward'](
-            q, k, v,
-            num_q_clusters=32,
-            num_k_clusters=32,
-            top_p=0.5,
-            kmeans_iters=3,
-        )
-        
-        assert not torch.isnan(output).any(), "Output contains NaN"
+    output, _, _ = svg2_components['svg2_attention_forward'](
+        q, k, v,
+        num_q_clusters=32,
+        num_k_clusters=32,
+        top_p=0.5,
+        kmeans_iters=3,
+    )
+
+    assert not torch.isnan(output).any(), "Output contains NaN"
         assert not torch.isinf(output).any(), "Output contains Inf"
 
     @pytest.mark.parametrize("top_p", [0.3, 0.5, 0.8])
@@ -499,15 +499,15 @@ class TestFullSVG2Attention:
         k = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
         v = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
         
-        output = svg2_components['svg2_attention_forward'](
-            q, k, v,
-            num_q_clusters=16,
-            num_k_clusters=16,
-            top_p=top_p,
-            kmeans_iters=3,
-        )
-        
-        assert output.shape == q.shape
+    output, _, _ = svg2_components['svg2_attention_forward'](
+        q, k, v,
+        num_q_clusters=16,
+        num_k_clusters=16,
+        top_p=top_p,
+        kmeans_iters=3,
+    )
+
+    assert output.shape == q.shape
         assert not torch.isnan(output).any()
 
 
@@ -539,16 +539,16 @@ class TestCorrectnessVsDense:
         attn_weights = torch.softmax(scores, dim=-1)
         dense_out = torch.matmul(attn_weights, v_t).transpose(1, 2)
         
-        # SVG2 with high top_p
-        svg2_out = svg2_components['svg2_attention_forward'](
-            q, k, v,
-            num_q_clusters=8,
-            num_k_clusters=8,
-            top_p=0.95,
-            kmeans_iters=5,
-        )
-        
-        max_diff = (svg2_out - dense_out).abs().max().item()
+    # SVG2 with high top_p
+    svg2_out, _, _ = svg2_components['svg2_attention_forward'](
+        q, k, v,
+        num_q_clusters=8,
+        num_k_clusters=8,
+        top_p=0.95,
+        kmeans_iters=5,
+    )
+
+    max_diff = (svg2_out - dense_out).abs().max().item()
         # With high top_p, should be reasonably close
         assert max_diff < 5.0, f"Max diff too large: {max_diff}"
 
@@ -563,13 +563,14 @@ class TestCorrectnessVsDense:
             k = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
             v = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
             
-            # Use same seed for internal randomness
-            torch.manual_seed(seed)
-            return svg2_components['svg2_attention_forward'](
-                q, k, v, num_q_clusters=16, num_k_clusters=16, top_p=0.5, kmeans_iters=3
-            )
-        
-        out1 = run_with_seed(123)
+        # Use same seed for internal randomness
+        torch.manual_seed(seed)
+        output, _, _ = svg2_components['svg2_attention_forward'](
+            q, k, v, num_q_clusters=16, num_k_clusters=16, top_p=0.5, kmeans_iters=3
+        )
+        return output
+    
+    out1 = run_with_seed(123)
         out2 = run_with_seed(123)
         
         torch.testing.assert_close(out1, out2)
