@@ -1,7 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-from typing import Type
+from typing import Type, Any
 
 import torch
 import torch.nn as nn
@@ -466,12 +466,14 @@ class USPAttention_SVG2(nn.Module):
         replicated_q: torch.Tensor | None = None,
         replicated_k: torch.Tensor | None = None,
         replicated_v: torch.Tensor | None = None,
+        attn_metadata: Any = None,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention_SVG2.
 
         Args:
             q, k, v: [B, S_local, H, D]
+            attn_metadata: Optional metadata passed from caller (e.g. from WanTransformerBlock_SVG2)
 
         Note: Replicated tensors are not supported in this implementation.
         """
@@ -479,12 +481,14 @@ class USPAttention_SVG2(nn.Module):
             replicated_q is None and replicated_k is None and replicated_v is None
         ), "USPAttention_SVG2 does not support replicated_qkv."
         
-        forward_context: ForwardContext = get_forward_context()
-        ctx_attn_metadata = forward_context.attn_metadata
+        # If attn_metadata is provided explicitly, use it; otherwise get from global context
+        if attn_metadata is None:
+            forward_context: ForwardContext = get_forward_context()
+            attn_metadata = forward_context.attn_metadata
         
         if get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.
-            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            out = self.attn_impl.forward(q, k, v, attn_metadata)
             return out
 
         # Ulysses-style All-to-All for sequence/head sharding
@@ -498,10 +502,10 @@ class USPAttention_SVG2(nn.Module):
         if get_ring_parallel_world_size() > 1:
             # For SVG2, we don't support ring attention yet
             # Fall back to local SVG2 attention
-            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            out = self.attn_impl.forward(q, k, v, attn_metadata)
         else:
             # -> [B, S, H_local, D]
-            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            out = self.attn_impl.forward(q, k, v, attn_metadata)
 
         # Ulysses-style All-to-All to restore original sharding
         if get_ulysses_parallel_world_size() > 1:
