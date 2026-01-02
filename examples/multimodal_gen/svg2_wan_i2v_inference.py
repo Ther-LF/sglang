@@ -110,9 +110,9 @@ def parse_args():
     )
     parser.add_argument(
         "--top-p-kmeans",
-        type=float,
-        default=0.9,
-        help="Top-p for block mask selection"
+        type=str,
+        default="0.9",
+        help="Top-p for block mask selection. Supports single value or comma-separated list (e.g., '0.5,0.7,0.9')"
     )
     parser.add_argument(
         "--min-kc-ratio",
@@ -217,49 +217,56 @@ def main():
     # Get resolution dimensions
     height, width = get_resolution_dims(args.resolution)
     
-    # Calculate actual layer/timestep thresholds
-    # These will be passed to the model through attention metadata
-    # For now, we'll use the default mechanism in SVG2SparseAttentionImpl
+    # Parse top-p values (support comma-separated list)
+    top_p_values = [float(x.strip()) for x in args.top_p_kmeans.split(',')]
     
     # Create output directory
     os.makedirs(args.output_path, exist_ok=True)
     
-    # Generate output filename if not specified
+    # Generate base output filename if not specified
     if args.output_filename is None:
         import hashlib
         prompt_hash = hashlib.md5(args.prompt.encode()).hexdigest()[:8]
         args.output_filename = f"svg2_i2v_{args.resolution}_{prompt_hash}.mp4"
     
-    output_file = os.path.join(args.output_path, args.output_filename)
-    
     print("=" * 70)
-    print("SVG2 WAN I2V Inference")
+    print("SVG2 WAN I2V Inference - Multi-Config Test")
     print("=" * 70)
     print(f"Model: {args.model_path}")
     print(f"Resolution: {args.resolution} ({height}x{width})")
     print(f"Attention Backend: {args.attention_backend}")
     print(f"Inference Steps: {args.num_inference_steps}")
-    print(f"SVG2 Config:")
+    print(f"SVG2 Base Config:")
     print(f"  - Q Clusters: {args.num_q_clusters}")
     print(f"  - K Clusters: {args.num_k_clusters}")
-    print(f"  - Top-p: {args.top_p_kmeans}")
+    print(f"  - Top-p Values to Test: {top_p_values}")
     print(f"  - First Times FP: {args.first_times_fp}")
     print(f"  - First Layers FP: {args.first_layers_fp}")
-    print(f"Output: {output_file}")
+    print(f"Output Dir: {args.output_path}")
     print("=" * 70)
     
     # Define experiments
-    # (backend_name, display_name, filename_suffix)
-    experiments = [(args.attention_backend, "SVG2 Sparse", "")]
+    # (backend_name, display_name, filename_suffix, top_p_value)
+    experiments = []
+    
+    # Add SVG2 experiments for each top-p value
+    for top_p in top_p_values:
+        label = f"SVG2 (p={top_p})"
+        suffix = f"_p{top_p:.1f}".replace('.', '')  # e.g., _p09 for 0.9
+        experiments.append((args.attention_backend, label, suffix, top_p))
+    
+    # Optionally add dense baseline
     if args.compare_with_dense:
-        experiments.append(("flash_attn_2", "Dense (FlashAttn2)", "_dense"))
+        experiments.append(("flash_attn_2", "Dense (FlashAttn2)", "_dense", None))
     
     benchmark_results = {}
 
-    for backend, label, suffix in experiments:
+    for backend, label, suffix, top_p in experiments:
         print(f"\n{'='*50}")
-        print(f" Running Inference with {label} Backend")
+        print(f" Running Inference: {label}")
         print(f"{'='*50}")
+        if top_p is not None:
+            print(f" Top-p: {top_p}")
         
         # Determine output filename for this run
         current_filename = args.output_filename
@@ -270,19 +277,35 @@ def main():
         
         current_output_path = os.path.join(args.output_path, current_filename)
 
+        # Prepare generator kwargs
+        gen_kwargs = dict(
+            model_path=args.model_path,
+            num_gpus=args.num_gpus,
+            ulysses_degree=args.ulysses_degree,
+            ring_degree=args.ring_degree,
+            attention_backend=backend,
+            text_encoder_cpu_offload=args.text_encoder_cpu_offload,
+            pin_cpu_memory=args.pin_cpu_memory,
+        )
+        
+        # Add SVG2-specific parameters if using sparse attention
+        if backend == args.attention_backend and top_p is not None:
+            gen_kwargs.update({
+                'num_q_clusters': args.num_q_clusters,
+                'num_k_clusters': args.num_k_clusters,
+                'top_p_kmeans': top_p,
+                'min_kc_ratio': args.min_kc_ratio,
+                'kmeans_iter_init': args.kmeans_iter_init,
+                'kmeans_iter_step': args.kmeans_iter_step,
+                'first_times_fp': args.first_times_fp,
+                'first_layers_fp': args.first_layers_fp,
+            })
+
         # Create generator
         try:
-            generator = DiffGenerator.from_pretrained(
-                model_path=args.model_path,
-                num_gpus=args.num_gpus,
-                ulysses_degree=args.ulysses_degree,
-                ring_degree=args.ring_degree,
-                attention_backend=backend,
-                text_encoder_cpu_offload=args.text_encoder_cpu_offload,
-                pin_cpu_memory=args.pin_cpu_memory,
-            )
+            generator = DiffGenerator.from_pretrained(**gen_kwargs)
         except Exception as e:
-            print(f"Failed to initialize generator with {backend}: {e}")
+            print(f"Failed to initialize generator: {e}")
             continue
 
         # Generate video
@@ -329,7 +352,9 @@ def main():
             benchmark_results[label] = elapsed
             
         except Exception as e:
-            print(f"Generation failed with {backend}: {e}")
+            print(f"Generation failed: {e}")
+            import traceback
+            traceback.print_exc()
         
         # Cleanup
         generator.shutdown()
@@ -338,24 +363,57 @@ def main():
         torch.cuda.empty_cache()
 
     # Print Comparison Summary
-    if args.compare_with_dense and len(benchmark_results) > 1:
-        print("\n" + "=" * 70)
+    if len(benchmark_results) > 1:
+        print("\n" + "=" * 80)
         print(" Performance Comparison Summary")
-        print("=" * 70)
-        print(f" {'Method':<25} | {'Time (s)':<10} | {'Speedup':<10}")
-        print("-" * 70)
+        print("=" * 80)
+        print(f" {'Configuration':<30} | {'Time (s)':<12} | {'Speedup vs Dense':<18}")
+        print("-" * 80)
         
-        dense_time = benchmark_results.get("Dense (FlashAttn2)", float('inf'))
+        # Get dense baseline time if available
+        dense_time = benchmark_results.get("Dense (FlashAttn2)", None)
         
-        for label, duration in benchmark_results.items():
+        # Sort results: Dense first (if exists), then SVG2 configs by top-p
+        sorted_results = []
+        if "Dense (FlashAttn2)" in benchmark_results:
+            sorted_results.append(("Dense (FlashAttn2)", benchmark_results["Dense (FlashAttn2)"]))
+        
+        # Add SVG2 results sorted by top-p value
+        svg2_results = [(k, v) for k, v in benchmark_results.items() if k != "Dense (FlashAttn2)"]
+        svg2_results.sort(key=lambda x: float(x[0].split('p=')[1].rstrip(')')))  # Sort by top-p value
+        sorted_results.extend(svg2_results)
+        
+        for label, duration in sorted_results:
             if label == "Dense (FlashAttn2)":
-                speedup_str = "1.00x"
-            else:
+                speedup_str = "Baseline (1.00x)"
+            elif dense_time is not None:
                 speedup = dense_time / duration if duration > 0 else 0
                 speedup_str = f"{speedup:.2f}x"
+            else:
+                speedup_str = "N/A"
             
-            print(f" {label:<25} | {duration:<10.2f} | {speedup_str:<10}")
-        print("=" * 70)
+            print(f" {label:<30} | {duration:<12.2f} | {speedup_str:<18}")
+        
+        print("=" * 80)
+        
+        # Additional analysis for SVG2 configs
+        if len(svg2_results) > 1:
+            print("\n SVG2 Top-p Trade-off Analysis:")
+            print(" " + "-" * 78)
+            fastest_svg2 = min(svg2_results, key=lambda x: x[1])
+            slowest_svg2 = max(svg2_results, key=lambda x: x[1])
+            print(f"   Fastest SVG2 Config: {fastest_svg2[0]} ({fastest_svg2[1]:.2f}s)")
+            print(f"   Slowest SVG2 Config: {slowest_svg2[0]} ({slowest_svg2[1]:.2f}s)")
+            variance = (slowest_svg2[1] - fastest_svg2[1]) / fastest_svg2[1] * 100
+            print(f"   Performance Variance: {variance:.1f}%")
+            print(" " + "-" * 78)
+    elif len(benchmark_results) == 1:
+        print("\n" + "=" * 80)
+        print(" Generation Summary")
+        print("=" * 80)
+        for label, duration in benchmark_results.items():
+            print(f" {label}: {duration:.2f} seconds")
+        print("=" * 80)
 
 
 if __name__ == "__main__":

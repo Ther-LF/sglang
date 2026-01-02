@@ -291,8 +291,8 @@ def main():
     comps = import_svg2_components()
     
     if args.scenario == "all":
-        print("\nNote: 'all' scenario runs 360p versions to avoid OOM.")
-        print("      Use wan_720p/hunyuan_720p for full resolution tests.\n")
+        print("\nNote: 'all' scenario will run ALL configurations (360p + 720p).")
+        print("      For faster testing, use wan_360p or hunyuan_360p.\n")
     
     # --- 1. Wan2.1 360p Scenario ---
     if args.scenario in ["all", "wan_360p"]:
@@ -305,7 +305,7 @@ def main():
         )
     
     # --- 2. Wan2.1 720p Scenario ---
-    if args.scenario in ["wan_720p"]:
+    if args.scenario in ["all", "wan_720p"]:
         # Wan2.1-14B 720p: 21 frames * 3600 tokens = 75,600 tokens
         # H=40, D=128
         run_model_benchmark(
@@ -325,7 +325,7 @@ def main():
         )
     
     # --- 4. HunyuanVideo 720p Scenario ---
-    if args.scenario in ["hunyuan_720p"]:
+    if args.scenario in ["all", "hunyuan_720p"]:
         # HunyuanVideo-13B 720p: 33 frames * 3600 tokens = 118,800 tokens
         # H=48, D=128
         run_model_benchmark(
