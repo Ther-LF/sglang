@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
-Benchmark script for SVG2 Sparse Attention.
+Benchmark script for SVG2 Sparse Attention (Real-world Video Gen Workloads).
 
-Compares SVG2 implementation with PyTorch dense attention across:
-1. Individual components (K-Means, Permutation, Block Sparse Attention)
-2. Full attention forward pass
-3. Different sequence lengths and sparsity levels
+Target Models:
+1. Wan2.1-I2V/T2V-14B: 21 frames * 3600 tokens = ~75,600 tokens. (H=40, D=128)
+2. HunyuanVideo-13B: 33 frames * 3600 tokens = ~118,800 tokens. (H=48, D=128)
 
 Usage:
-    python benchmark_svg2_sparse_attn.py
-    python benchmark_svg2_sparse_attn.py --seq-lengths 1024 4096 8192
-    python benchmark_svg2_sparse_attn.py --top-p 0.3 0.5 0.7
+    python benchmark_real_world.py
+    python benchmark_real_world.py --scenario wan
+    python benchmark_real_world.py --scenario hunyuan
 """
 
 import argparse
 import math
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -25,26 +24,15 @@ import torch
 # Utilities
 # ============================================================================
 
-
-@dataclass
-class BenchmarkResult:
-    """Result of a single benchmark."""
-    name: str
-    time_ms: float
-    memory_mb: float = 0.0
-
-
-def benchmark_fn(
-    fn: Callable,
-    warmup: int = 3,
-    repeat: int = 10,
-    sync: bool = True,
-) -> float:
+def benchmark_fn(fn: Callable, warmup: int = 2, repeat: int = 5, sync: bool = True) -> float:
     """Benchmark a function and return average time in milliseconds."""
     # Warmup
     for _ in range(warmup):
-        fn()
-    
+        try:
+            fn()
+        except RuntimeError:
+            return float('inf') # Fail fast on OOM during warmup
+            
     if sync and torch.cuda.is_available():
         torch.cuda.synchronize()
     
@@ -58,631 +46,188 @@ def benchmark_fn(
     
     return (time.perf_counter() - start) / repeat * 1000
 
-
-def get_memory_mb() -> float:
-    """Get current GPU memory usage in MB."""
-    if torch.cuda.is_available():
-        return torch.cuda.memory_allocated() / 1024 / 1024
-    return 0.0
-
-
 def print_header(title: str):
-    """Print a formatted header."""
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 80)
     print(f" {title}")
-    print("=" * 70)
-
-
-def print_comparison(name: str, svg2_ms: float, torch_ms: float):
-    """Print a comparison result."""
-    speedup = torch_ms / svg2_ms if svg2_ms > 0 else 0
-    faster = "SVG2" if speedup > 1 else "Torch"
-    ratio = speedup if speedup > 1 else 1 / speedup if speedup > 0 else 0
-    
-    print(f"  {name:40s} | SVG2: {svg2_ms:8.2f}ms | Torch: {torch_ms:8.2f}ms | {faster} {ratio:.2f}x faster")
-
+    print("=" * 80)
 
 # ============================================================================
-# Import SVG2 Components
+# Import Components
 # ============================================================================
-
 
 def import_svg2_components():
-    """Import SVG2 components."""
     from sglang.multimodal_gen.runtime.layers.attention.backends.svg2_sparse_attn import (
-        block_sparse_attention,
-        identify_dynamic_mask,
-        inverse_permute,
-        permute_by_labels,
         svg2_attention_forward,
-        triton_kmeans,
     )
-    
-    # Try importing flash_attn_func for comparison
-    try:
-        from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import flash_attn_func
-    except ImportError:
-        flash_attn_func = None
-
-    return {
-        'triton_kmeans': triton_kmeans,
-        'permute_by_labels': permute_by_labels,
-        'inverse_permute': inverse_permute,
-        'identify_dynamic_mask': identify_dynamic_mask,
-        'block_sparse_attention': block_sparse_attention,
-        'svg2_attention_forward': svg2_attention_forward,
-        'flash_attn_func': flash_attn_func,
-    }
-
+    return {'svg2_attention_forward': svg2_attention_forward}
 
 # ============================================================================
-# Torch Reference Implementations
+# Baselines
 # ============================================================================
-
-
-def torch_kmeans(x: torch.Tensor, n_clusters: int, max_iters: int = 10):
-    """Simple PyTorch K-Means implementation."""
-    B, N, D = x.shape
-    device = x.device
-    dtype = x.dtype
-    
-    # Random initialization
-    indices = torch.randint(0, N, (B, n_clusters), device=device)
-    batch_offset = torch.arange(B, device=device)[:, None] * N
-    flat_indices = (batch_offset + indices).flatten()
-    centroids = x.reshape(B * N, D)[flat_indices].reshape(B, n_clusters, D).float()
-    
-    for _ in range(max_iters):
-        # Compute distances [B, N, K]
-        x_expanded = x.float().unsqueeze(2)  # [B, N, 1, D]
-        c_expanded = centroids.unsqueeze(1)  # [B, 1, K, D]
-        dist = ((x_expanded - c_expanded) ** 2).sum(dim=-1)  # [B, N, K]
-        
-        # Assign clusters
-        labels = dist.argmin(dim=-1)  # [B, N]
-        
-        # Update centroids
-        new_centroids = torch.zeros_like(centroids)
-        counts = torch.zeros(B, n_clusters, device=device)
-        
-        for b in range(B):
-            for k in range(n_clusters):
-                mask = labels[b] == k
-                if mask.sum() > 0:
-                    new_centroids[b, k] = x[b, mask].float().mean(dim=0)
-                    counts[b, k] = mask.sum()
-        
-        centroids = new_centroids
-    
-    # Compute cluster sizes
-    cluster_sizes = torch.zeros(B, n_clusters, dtype=torch.int32, device=device)
-    for b in range(B):
-        for k in range(n_clusters):
-            cluster_sizes[b, k] = (labels[b] == k).sum()
-    
-    return labels, centroids.to(dtype), cluster_sizes
-
 
 def torch_dense_attention(q, k, v, scale=None):
-    """PyTorch dense attention."""
-    B, S, H, D = q.shape
-    if scale is None:
-        scale = 1.0 / math.sqrt(D)
-    
-    # Transpose to [B, H, S, D]
+    if scale is None: scale = 1.0 / math.sqrt(q.shape[-1])
+    # [B, S, H, D] -> [B, H, S, D]
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
-    
-    # Compute attention
-    scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
-    attn_weights = torch.softmax(scores, dim=-1)
-    output = torch.matmul(attn_weights, v.float())
-    
-    # Transpose back
-    return output.transpose(1, 2).to(q.dtype)
-
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    attn = torch.softmax(scores, dim=-1)
+    out = torch.matmul(attn, v)
+    return out.transpose(1, 2)
 
 def torch_sdpa_attention(q, k, v, scale=None):
-    """PyTorch scaled_dot_product_attention."""
-    B, S, H, D = q.shape
-    if scale is None:
-        scale = 1.0 / math.sqrt(D)
-    
-    # Transpose to [B, H, S, D]
+    if scale is None: scale = 1.0 / math.sqrt(q.shape[-1])
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
-    
-    # Use SDPA
-    output = torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, scale=scale
-    )
-    
-    return output.transpose(1, 2)
-
+    out = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=scale)
+    return out.transpose(1, 2)
 
 # ============================================================================
-# Component Benchmarks
+# Core Benchmark Logic
 # ============================================================================
 
-
-def benchmark_kmeans(svg2_components: dict, device: str = "cuda"):
-    """Benchmark K-Means clustering."""
-    print_header("K-Means Clustering Benchmark")
-    
-    configs = [
-        # (B, N, D, K)
-        (1, 1024, 64, 16),
-        (1, 4096, 64, 32),
-        (1, 8192, 64, 64),
-        (2, 4096, 128, 64),
-        # Larger config
-        (1, 16384, 128, 128),
-    ]
-    
-    for B, N, D, K in configs:
-        x = torch.randn(B, N, D, device=device, dtype=torch.float16)
-        
-        # SVG2 K-Means (Triton)
-        svg2_time = benchmark_fn(
-            lambda: svg2_components['triton_kmeans'](x, K, max_iters=5)
-        )
-        
-        # Torch K-Means (Standard loop implementation)
-        torch_time = benchmark_fn(
-            lambda: torch_kmeans(x, K, max_iters=5)
-        )
-        
-        name = f"B={B}, N={N}, D={D}, K={K}"
-        print_comparison(name, svg2_time, torch_time)
-
-
-def benchmark_permutation(svg2_components: dict, device: str = "cuda"):
-    """Benchmark permutation operations."""
-    print_header("Permutation Benchmark")
-    
-    configs = [
-        # (B, H, S, D)
-        (1, 8, 1024, 64),
-        (1, 16, 4096, 64),
-        (1, 24, 8192, 128),
-        # Larger config
-        (1, 16, 16384, 128),
-    ]
-    
-    for B, H, S, D in configs:
-        x = torch.randn(B, H, S, D, device=device, dtype=torch.float16)
-        labels = torch.randint(0, 32, (B * H, S), device=device)
-        
-        # SVG2 Permutation (Triton)
-        # Includes both permute and sort inside if needed, but permute_by_labels does sort internally
-        svg2_time = benchmark_fn(
-            lambda: svg2_components['permute_by_labels'](x, labels)
-        )
-        
-        # Torch Permutation (argsort + gather)
-        # This is the standard way to do it in PyTorch
-        def torch_permute():
-            sorted_indices = torch.argsort(labels, dim=-1)
-            x_flat = x.reshape(B * H, S, D)
-            expanded_indices = sorted_indices.unsqueeze(-1).expand(-1, -1, D)
-            return torch.gather(x_flat, 1, expanded_indices).reshape(B, H, S, D)
-        
-        torch_time = benchmark_fn(torch_permute)
-        
-        name = f"B={B}, H={H}, S={S}, D={D}"
-        print_comparison(name, svg2_time, torch_time)
-
-
-def benchmark_block_sparse_attention(svg2_components: dict, device: str = "cuda"):
-    """Benchmark block sparse attention."""
-    print_header("Block Sparse Attention Benchmark")
-    
-    configs = [
-        # (B, H, S, D, Kq, Kk, sparsity)
-        (1, 8, 1024, 64, 16, 16, 0.5),
-        (1, 16, 4096, 64, 32, 32, 0.5),
-        (1, 16, 4096, 64, 32, 32, 0.7),
-        # Larger config
-        (1, 16, 8192, 128, 64, 64, 0.8),
-    ]
-    
-    for B, H, S, D, Kq, Kk, sparsity in configs:
-        q = torch.randn(B, H, S, D, device=device, dtype=torch.float16)
-        k = torch.randn(B, H, S, D, device=device, dtype=torch.float16)
-        v = torch.randn(B, H, S, D, device=device, dtype=torch.float16)
-        
-        # Create block sizes and mask
-        block_size = S // Kq
-        q_cluster_sizes = torch.full((B, H, Kq), block_size, dtype=torch.int32, device=device)
-        k_cluster_sizes = torch.full((B, H, Kk), block_size, dtype=torch.int32, device=device)
-        
-        # Random mask with specified sparsity
-        block_mask = torch.rand(B, H, Kq, Kk, device=device) > sparsity
-        # Ensure at least diagonal is kept
-        for i in range(min(Kq, Kk)):
-            block_mask[:, :, i, i] = True
-        
-        # SVG2 Block Sparse Attention (Triton)
-        svg2_time = benchmark_fn(
-            lambda: svg2_components['block_sparse_attention'](
-                q, k, v, block_mask, q_cluster_sizes, k_cluster_sizes
-            )
-        )
-        
-        # Torch Dense Attention (for comparison baseline)
-        q_t = q.transpose(1, 2).contiguous()  # [B, S, H, D]
-        k_t = k.transpose(1, 2).contiguous()
-        v_t = v.transpose(1, 2).contiguous()
-        
-        torch_time = benchmark_fn(
-            lambda: torch_dense_attention(q_t, k_t, v_t)
-        )
-        
-        actual_sparsity = 1 - block_mask.float().mean().item()
-        name = f"S={S}, K={Kq}, D={D}, sparsity={actual_sparsity:.0%}"
-        print_comparison(name, svg2_time, torch_time)
-
-
-# ============================================================================
-# Full Attention Benchmark
-# ============================================================================
-
-
-def benchmark_full_attention(
+def run_model_benchmark(
+    name: str,
+    B: int, H: int, D: int, S: int,
     svg2_components: dict,
-    device: str = "cuda",
-    seq_lengths: Optional[List[int]] = None,
-    top_p_values: Optional[List[float]] = None,
-    fixed_clusters: Optional[int] = None,
-    max_k_per_q: Optional[int] = None,
-    kmeans_iters: int = 2,
-    batch_size: int = 1,
-    num_heads: int = 16,
-    head_dim: int = 128,
+    device: str = "cuda"
 ):
-    """Benchmark full SVG2 attention vs Torch attention."""
-    print_header("Full Attention Benchmark: SVG2 vs Torch")
-    
-    if seq_lengths is None:
-        seq_lengths = [1024, 2048, 4096, 8192, 16384, 32768]
-    
-    if top_p_values is None:
-        top_p_values = [0.3, 0.5, 0.7, 0.9]
-    
-    B, H, D = batch_size, num_heads, head_dim
-    num_clusters = 64
-    
-    print(f"\n  Config: B={B}, H={H}, D={D}")
-    print("-" * 70)
-    
-    for S in seq_lengths:
-        print(f"\n  Sequence Length: {S}")
-        print("-" * 50)
-        
+    print_header(f"Scenario: {name}")
+    print(f"  Configuration: Batch={B}, Heads={H}, Dim={D}, SeqLen={S}")
+    print(f"  Total Tokens : {B*S:,}")
+    print(f"  Memory (Est) : ~{B*S*H*D*2*3 / 1024**3:.2f} GB (KV Cache + Q)")
+    print("-" * 80)
+
+    # 1. Prepare Data
+    try:
         q = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
         k = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
         v = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
-        
-        # Torch Dense Attention
+    except RuntimeError as e:
+        print(f"  Skipping: OOM during tensor allocation. {e}")
+        return
+
+    # 2. Run Baselines
+    # Dense
+    print(f"  Running Torch Dense (Reference)... ", end="", flush=True)
+    if S > 16384:
+        dense_ms = float('inf')
+        print("Skipped (Predict OOM)")
+    else:
         try:
-            torch_dense_time = benchmark_fn(
-                lambda: torch_dense_attention(q, k, v)
-            )
-        except RuntimeError: # OOM
-            torch_dense_time = float('inf')
-        
-        # Torch SDPA (FlashAttention if available)
-        torch_sdpa_time = benchmark_fn(
-            lambda: torch_sdpa_attention(q, k, v)
-        )
-        
-        # FlashAttention Library (Dao-AILab) if available
-        flash_lib_time = float('inf')
-        if svg2_components.get('flash_attn_func') is not None:
-            # flash_attn_func expects [B, S, H, D]
-            try:
-                flash_lib_time = benchmark_fn(
-                    lambda: svg2_components['flash_attn_func'](
-                        q, k, v, 
-                        dropout_p=0.0, 
-                        softmax_scale=1.0/math.sqrt(D), 
-                        causal=False
-                    )
-                )
-            except Exception as e:
-                # Fallback if args differ or error
-                pass
+            dense_ms = benchmark_fn(lambda: torch_dense_attention(q, k, v))
+            print(f"{dense_ms:.2f} ms")
+        except RuntimeError:
+            dense_ms = float('inf')
+            print("OOM")
 
-        print(f"    {'Method':35s} | {'Time (ms)':>12s} | {'vs Dense':>12s} | {'vs SDPA':>12s}")
-        print("    " + "-" * 75)
-        
-        dense_str = f"{torch_dense_time:12.2f}" if torch_dense_time != float('inf') else "         OOM"
-        print(f"    {'Torch Dense':35s} | {dense_str} | {'1.00x':>12s} | {torch_dense_time/torch_sdpa_time:.2f}x slower")
-        print(f"    {'Torch SDPA':35s} | {torch_sdpa_time:12.2f} | {torch_sdpa_time/torch_dense_time:.2f}x faster | {'1.00x':>12s}")
-        
-        if flash_lib_time != float('inf'):
-            vs_dense_fa = torch_dense_time / flash_lib_time if flash_lib_time > 0 and torch_dense_time != float('inf') else 0
-            vs_sdpa_fa = torch_sdpa_time / flash_lib_time if flash_lib_time > 0 else 0
-            
-            if torch_dense_time == float('inf'): vs_dense_fa_str = "        Inf"
-            else: vs_dense_fa_str = f"{vs_dense_fa:.2f}x faster" if vs_dense_fa > 1 else f"{1/vs_dense_fa:.2f}x slower"
-            
-            vs_sdpa_fa_str = f"{vs_sdpa_fa:.2f}x faster" if vs_sdpa_fa > 1 else f"{1/vs_sdpa_fa:.2f}x slower"
-            
-            print(f"    {'FlashAttn (Dao)':35s} | {flash_lib_time:12.2f} | {vs_dense_fa_str:>12s} | {vs_sdpa_fa_str:>12s}")
+    # SDPA (FlashAttention)
+    print(f"  Running Torch SDPA (FlashAttn)...  ", end="", flush=True)
+    try:
+        sdpa_ms = benchmark_fn(lambda: torch_sdpa_attention(q, k, v))
+        print(f"{sdpa_ms:.2f} ms")
+    except RuntimeError:
+        sdpa_ms = float('inf')
+        print("OOM")
 
-        # SVG2 with different sparsity levels
-        for top_p in top_p_values:
-            # Choose number of clusters
-            if fixed_clusters is not None:
-                scaled_clusters = fixed_clusters
-            else:
-                # Scale clusters with sequence length to maintain reasonable block sizes
-                scaled_clusters = max(16, S // 64)  # e.g. 1024->16, 4096->64, 16384->256
-
-            # Cap number of active key clusters per query cluster to keep latency in check
-            if max_k_per_q is None:
-                max_k_per_q_eff = max(4, min(32, scaled_clusters // 8))
-            else:
-                max_k_per_q_eff = max_k_per_q
-            
-            svg2_time = benchmark_fn(
-                lambda tp=top_p, nc=scaled_clusters, tk=max_k_per_q_eff: svg2_components['svg2_attention_forward'](
-                    q, k, v,
-                    num_q_clusters=nc,
-                    num_k_clusters=nc,
-                    top_p=tp,
-                    kmeans_iters=kmeans_iters,
-                    max_k_clusters_per_q=tk,
-                )
-            )
-            
-            vs_dense = torch_dense_time / svg2_time if svg2_time > 0 and torch_dense_time != float('inf') else 0
-            vs_sdpa = torch_sdpa_time / svg2_time if svg2_time > 0 else 0
-            
-            if torch_dense_time == float('inf'):
-                vs_dense_str = "        Inf"
-            elif vs_dense > 1:
-                vs_dense_str = f"{vs_dense:.2f}x faster"
-            elif vs_dense > 0:
-                vs_dense_str = f"{1/vs_dense:.2f}x slower"
-            else:
-                vs_dense_str = "        N/A"
-            
-            if vs_sdpa > 1:
-                vs_sdpa_str = f"{vs_sdpa:.2f}x faster"
-            elif vs_sdpa > 0:
-                vs_sdpa_str = f"{1/vs_sdpa:.2f}x slower"
-            else:
-                vs_sdpa_str = "        N/A"
-
-            if torch_dense_time == float('inf'): vs_dense_str = "        Inf"
-            
-            sparsity = (1 - top_p) * 100
-            method_name = f"SVG2 (p={top_p}, K={scaled_clusters}, tk={max_k_per_q_eff})"
-            print(f"    {method_name:35s} | {svg2_time:12.2f} | {vs_dense_str:>12s} | {vs_sdpa_str:>12s}")
-
-
-# ============================================================================
-# Memory Benchmark
-# ============================================================================
-
-
-def benchmark_memory(svg2_components: dict, device: str = "cuda"):
-    """Benchmark memory usage."""
-    print_header("Memory Usage Benchmark")
-    
+    # 3. Run SVG2 Configurations
+    # Settings from Paper: Cq=100, Ck=500 (Section D)
     configs = [
-        # (B, S, H, D)
-        (1, 4096, 16, 64),
-        (1, 8192, 16, 64),
-        (1, 16384, 16, 64),
-        # Even larger
-        (1, 32768, 16, 64),
+        # (Top-P, QC, KC, Max_K_per_Q)
+        (0.5, 100, 500, None), 
+        (0.7, 100, 500, None),
+        (0.9, 100, 500, None), 
+        # Add a "Turbo" setting with cap
+        (0.9, 100, 500, 32), 
     ]
-    
-    print(f"  {'Config':30s} | {'Dense (MB)':>12s} | {'SVG2 (MB)':>12s} | {'Savings':>12s}")
-    print("-" * 70)
-    
-    for B, S, H, D in configs:
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+
+    print("\n  SVG2 Results:")
+    print(f"    {'Setting':40s} | {'Time (ms)':>12s} | {'vs SDPA':>12s} | {'vs Dense':>12s}")
+    print("    " + "-" * 76)
+
+    for top_p, qc, kc, cap in configs:
+        desc = f"P={top_p}, Qc={qc}, Kc={kc}"
+        if cap: desc += f", Cap={cap}"
         
         try:
-            q = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
-            k = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
-            v = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
-            
-            # Measure dense attention memory
-            torch.cuda.reset_peak_memory_stats()
-            try:
-                _ = torch_dense_attention(q, k, v)
-                torch.cuda.synchronize()
-                dense_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
-            except RuntimeError:
-                dense_memory = float('inf')
-            
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-            
-            # Measure SVG2 memory
-            scaled_clusters = max(16, S // 64)
-            _ = svg2_components['svg2_attention_forward'](
-                q, k, v,
-                num_q_clusters=scaled_clusters,
-                num_k_clusters=scaled_clusters,
-                top_p=0.5,
-                kmeans_iters=3,
-            )
-            torch.cuda.synchronize()
-            svg2_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
-            
-            if dense_memory != float('inf'):
-                savings = (1 - svg2_memory / dense_memory) * 100 if dense_memory > 0 else 0
-                savings_str = f"{savings:10.1f}%"
-                dense_str = f"{dense_memory:12.1f}"
-            else:
-                savings_str = "       N/A"
-                dense_str = "         OOM"
-            
-            name = f"B={B}, S={S}, H={H}, D={D}"
-            print(f"  {name:30s} | {dense_str} | {svg2_memory:12.1f} | {savings_str}")
-            
-        except RuntimeError as e:
-             print(f"  B={B}, S={S}...             |        Error |        Error | Error: {e}")
-
-
-# ============================================================================
-# Scalability Benchmark
-# ============================================================================
-
-
-def benchmark_scalability(svg2_components: dict, device: str = "cuda"):
-    """Benchmark scalability with sequence length."""
-    print_header("Scalability Benchmark (Time vs Sequence Length)")
-    
-    B, H, D = 1, 16, 64
-    seq_lengths = [512, 1024, 2048, 4096, 8192, 16384, 32768]
-    
-    print(f"\n  Config: B={B}, H={H}, D={D}")
-    print(f"  {'Seq Len':>10s} | {'Dense (ms)':>12s} | {'SDPA (ms)':>12s} | {'SVG2 (ms)':>12s} | {'SVG2 Speedup':>14s}")
-    print("-" * 70)
-    
-    for S in seq_lengths:
-        try:
-            q = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
-            k = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
-            v = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
-            
-            # Torch Dense
-            try:
-                dense_time = benchmark_fn(lambda: torch_dense_attention(q, k, v), repeat=5)
-            except RuntimeError:  # OOM
-                dense_time = float('inf')
-            
-            # Torch SDPA
-            try:
-                sdpa_time = benchmark_fn(lambda: torch_sdpa_attention(q, k, v), repeat=5)
-            except RuntimeError:
-                sdpa_time = float('inf')
-            
-            # SVG2
-            scaled_clusters = max(16, S // 64)
-            svg2_time = benchmark_fn(
+            # We use iter=1 for step to simulate "next step" performance (using cache)
+            # But here we assume cold start or average step. 
+            # Paper uses kmeans_iters=1 for steps.
+            svg2_ms = benchmark_fn(
                 lambda: svg2_components['svg2_attention_forward'](
                     q, k, v,
-                    num_q_clusters=scaled_clusters,
-                    num_k_clusters=scaled_clusters,
-                    top_p=0.5,
-                    kmeans_iters=3,
-                ),
-                repeat=5
+                    num_q_clusters=qc,
+                    num_k_clusters=kc,
+                    top_p=top_p,
+                    kmeans_iters=2, # Conservative estimate
+                    max_k_clusters_per_q=cap
+                )
             )
             
-            speedup = sdpa_time / svg2_time if svg2_time > 0 and sdpa_time != float('inf') else 0
-            speedup_str = f"{speedup:.2f}x vs SDPA"
-            
-            dense_str = f"{dense_time:.2f}" if dense_time != float('inf') else "OOM"
-            sdpa_str = f"{sdpa_time:.2f}" if sdpa_time != float('inf') else "OOM"
-            
-            print(f"  {S:10d} | {dense_str:>12s} | {sdpa_str:>12s} | {svg2_time:12.2f} | {speedup_str:>14s}")
-            
-        except RuntimeError as e:
-            print(f"  {S:10d} | Error: {e}")
+            # Formatting
+            speedup_sdpa = sdpa_ms / svg2_ms if svg2_ms > 0 and sdpa_ms != float('inf') else 0
+            if speedup_sdpa > 1: vs_sdpa_str = f"{speedup_sdpa:.2f}x faster"
+            elif speedup_sdpa > 0: vs_sdpa_str = f"{1/speedup_sdpa:.2f}x slower"
+            else: vs_sdpa_str = "N/A"
 
+            speedup_dense = dense_ms / svg2_ms if svg2_ms > 0 and dense_ms != float('inf') else 0
+            if speedup_dense > 1: vs_dense_str = f"{speedup_dense:.2f}x faster"
+            elif dense_ms == float('inf'): vs_dense_str = "        Inf"
+            else: vs_dense_str = f"{1/speedup_dense:.2f}x slower"
+
+            print(f"    {desc:40s} | {svg2_ms:12.2f} | {vs_sdpa_str:>12s} | {vs_dense_str:>12s}")
+
+        except RuntimeError as e:
+            print(f"    {desc:40s} |        Error | {str(e)}")
 
 # ============================================================================
 # Main
 # ============================================================================
 
-
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark SVG2 Sparse Attention")
-    parser.add_argument("--device", type=str, default="cuda", help="Device to use")
-    parser.add_argument("--seq-lengths", type=int, nargs="+", default=None, 
-                        help="Sequence lengths to benchmark")
-    parser.add_argument("--top-p", type=float, nargs="+", default=None,
-                        help="Top-p values to benchmark")
-    parser.add_argument("--fixed-clusters", type=int, default=None,
-                        help="If set, use a fixed number of clusters for full-attn benchmark (disables S//64 scaling).")
-    parser.add_argument("--max-k-per-q", type=int, default=None,
-                        help="If set, cap kept key clusters per query cluster in full-attn benchmark (tk).")
-    parser.add_argument("--full-kmeans-iters", type=int, default=2,
-                        help="KMeans iterations used in full-attn benchmark.")
-    parser.add_argument("--component", type=str, default="all",
-                        choices=["all", "kmeans", "permutation", "block_attn", "full", "memory", "scalability"],
-                        help="Which component to benchmark")
-    parser.add_argument("--batch-size", type=int, default=1, help="Batch size (B)")
-    parser.add_argument("--num-heads", type=int, default=16, help="Number of heads (H)")
-    parser.add_argument("--head-dim", type=int, default=128, help="Head dimension (D)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--scenario", type=str, default="all", choices=["all", "wan", "hunyuan", "scaling"])
     args = parser.parse_args()
-    
+
     if not torch.cuda.is_available():
-        print("ERROR: CUDA is required for benchmarking!")
+        print("CUDA required.")
         return
-    
-    print("=" * 70)
-    print(" SVG2 Sparse Attention Benchmark Suite")
-    print("=" * 70)
-    print(f"\n  Device: {torch.cuda.get_device_name()}")
-    print(f"  CUDA Version: {torch.version.cuda}")
-    print(f"  PyTorch Version: {torch.__version__}")
-    
-    components = import_svg2_components()
-    
-    if args.component == "all" or args.component == "kmeans":
-        benchmark_kmeans(components, args.device)
-    
-    if args.component == "all" or args.component == "permutation":
-        benchmark_permutation(components, args.device)
-    
-    if args.component == "all" or args.component == "block_attn":
-        benchmark_block_sparse_attention(components, args.device)
-    
-    if args.component == "all" or args.component == "full":
-        # Define model configurations (B, H, D)
-        model_configs = [
-            (args.batch_size, args.num_heads, args.head_dim), # User custom
-        ]
-        
-        # If user didn't specify custom flags (using defaults), add more standard configs
-        if args.batch_size == 1 and args.num_heads == 16 and args.head_dim == 128:
-            model_configs = [
-                (1, 16, 64),   # Small/Base
-                (1, 16, 128),  # Standard Video
-                (1, 24, 128),  # Large
-                (1, 32, 128),  # Larger (e.g. Wan-14B approx)
-                (1, 64, 128),  # Larger (e.g. Wan-14B approx)
-                (2, 16, 128),  # Batched
-            ]
 
-        for b, h, d in model_configs:
-            benchmark_full_attention(
-                components, 
-                args.device,
-                seq_lengths=args.seq_lengths,
-                top_p_values=args.top_p,
-                fixed_clusters=args.fixed_clusters,
-                max_k_per_q=args.max_k_per_q,
-                kmeans_iters=args.full_kmeans_iters,
-                batch_size=b,
-                num_heads=h,
-                head_dim=d,
+    print("Initializing SVG2 Components...")
+    comps = import_svg2_components()
+    
+    # --- 1. Wan2.1 Scenario ---
+    if args.scenario in ["all", "wan"]:
+        # Wan2.1-14B: 21 frames * 3600 tokens
+        # H=40, D=128
+        run_model_benchmark(
+            "Wan2.1-I2V-14B (720p)",
+            B=1, H=40, D=128, S=75600,
+            svg2_components=comps
+        )
+
+    # --- 2. HunyuanVideo Scenario ---
+    if args.scenario in ["all", "hunyuan"]:
+        # HunyuanVideo-13B: 33 frames * 3600 tokens
+        # H=48, D=128
+        run_model_benchmark(
+            "HunyuanVideo-T2V-13B (720p)",
+            B=1, H=48, D=128, S=118800,
+            svg2_components=comps
+        )
+
+    # --- 3. Scaling Curve (Standard) ---
+    if args.scenario in ["all", "scaling"]:
+        print_header("Standard Scaling Curve (H=24, D=128)")
+        lengths = [16384, 32768, 65536, 96000]
+        for S in lengths:
+            run_model_benchmark(
+                f"Scaling S={S}",
+                B=1, H=24, D=128, S=S,
+                svg2_components=comps
             )
-    
-    if args.component == "all" or args.component == "memory":
-        benchmark_memory(components, args.device)
-    
-    if args.component == "all" or args.component == "scalability":
-        benchmark_scalability(components, args.device)
-    
-    print("\n" + "=" * 70)
-    print(" Benchmark Complete!")
-    print("=" * 70)
-
 
 if __name__ == "__main__":
     main()
-
