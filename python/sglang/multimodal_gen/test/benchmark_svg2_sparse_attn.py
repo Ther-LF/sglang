@@ -97,6 +97,13 @@ def import_svg2_components():
         svg2_attention_forward,
         triton_kmeans,
     )
+    
+    # Try importing flash_attn_func for comparison
+    try:
+        from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import flash_attn_func
+    except ImportError:
+        flash_attn_func = None
+
     return {
         'triton_kmeans': triton_kmeans,
         'permute_by_labels': permute_by_labels,
@@ -104,6 +111,7 @@ def import_svg2_components():
         'identify_dynamic_mask': identify_dynamic_mask,
         'block_sparse_attention': block_sparse_attention,
         'svg2_attention_forward': svg2_attention_forward,
+        'flash_attn_func': flash_attn_func,
     }
 
 
@@ -370,6 +378,23 @@ def benchmark_full_attention(
             lambda: torch_sdpa_attention(q, k, v)
         )
         
+        # FlashAttention Library (Dao-AILab) if available
+        flash_lib_time = float('inf')
+        if svg2_components.get('flash_attn_func') is not None:
+            # flash_attn_func expects [B, S, H, D]
+            try:
+                flash_lib_time = benchmark_fn(
+                    lambda: svg2_components['flash_attn_func'](
+                        q, k, v, 
+                        dropout_p=0.0, 
+                        softmax_scale=1.0/math.sqrt(D), 
+                        causal=False
+                    )
+                )
+            except Exception as e:
+                # Fallback if args differ or error
+                pass
+
         print(f"    {'Method':35s} | {'Time (ms)':>12s} | {'vs Dense':>12s} | {'vs SDPA':>12s}")
         print("    " + "-" * 75)
         
@@ -377,6 +402,17 @@ def benchmark_full_attention(
         print(f"    {'Torch Dense':35s} | {dense_str} | {'1.00x':>12s} | {torch_dense_time/torch_sdpa_time:.2f}x slower")
         print(f"    {'Torch SDPA':35s} | {torch_sdpa_time:12.2f} | {torch_sdpa_time/torch_dense_time:.2f}x faster | {'1.00x':>12s}")
         
+        if flash_lib_time != float('inf'):
+            vs_dense_fa = torch_dense_time / flash_lib_time if flash_lib_time > 0 and torch_dense_time != float('inf') else 0
+            vs_sdpa_fa = torch_sdpa_time / flash_lib_time if flash_lib_time > 0 else 0
+            
+            if torch_dense_time == float('inf'): vs_dense_fa_str = "        Inf"
+            else: vs_dense_fa_str = f"{vs_dense_fa:.2f}x faster" if vs_dense_fa > 1 else f"{1/vs_dense_fa:.2f}x slower"
+            
+            vs_sdpa_fa_str = f"{vs_sdpa_fa:.2f}x faster" if vs_sdpa_fa > 1 else f"{1/vs_sdpa_fa:.2f}x slower"
+            
+            print(f"    {'FlashAttn (Dao)':35s} | {flash_lib_time:12.2f} | {vs_dense_fa_str:>12s} | {vs_sdpa_fa_str:>12s}")
+
         # SVG2 with different sparsity levels
         for top_p in top_p_values:
             # Choose number of clusters

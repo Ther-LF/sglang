@@ -177,6 +177,13 @@ def parse_args():
         help="Pin CPU memory for faster transfers"
     )
     
+    # Comparison
+    parser.add_argument(
+        "--compare-with-dense",
+        action="store_true",
+        help="Run comparison with dense attention (flash_attn_2)"
+    )
+    
     # Output arguments
     parser.add_argument(
         "--output-path", 
@@ -241,47 +248,114 @@ def main():
     print(f"Output: {output_file}")
     print("=" * 70)
     
-    # Create generator with SVG2 attention
-    generator = DiffGenerator.from_pretrained(
-        model_path=args.model_path,
-        num_gpus=args.num_gpus,
-        ulysses_degree=args.ulysses_degree,
-        ring_degree=args.ring_degree,
-        attention_backend=args.attention_backend,
-        text_encoder_cpu_offload=args.text_encoder_cpu_offload,
-        pin_cpu_memory=args.pin_cpu_memory,
-    )
+    # Define experiments
+    # (backend_name, display_name, filename_suffix)
+    experiments = [(args.attention_backend, "SVG2 Sparse", "")]
+    if args.compare_with_dense:
+        experiments.append(("flash_attn_2", "Dense (FlashAttn2)", "_dense"))
     
-    # Generate video
-    print("\nStarting generation...")
-    import time
-    start_time = time.time()
-    
-    result = generator.generate(
-        sampling_params_kwargs=dict(
-            prompt=args.prompt,
-            negative_prompt=args.negative_prompt,
-            image_path=args.image_path,  # Use image_path, not image
-            height=height,
-            width=width,
-            num_inference_steps=args.num_inference_steps,
-            seed=args.seed,
-            fps=args.fps,
-            output_path=args.output_path,
-            output_file_name=args.output_filename,
-            save_output=True,
-            return_frames=False,
-        )
-    )
-    
-    end_time = time.time()
-    elapsed = end_time - start_time
-    
-    print(f"\nGeneration completed in {elapsed:.2f} seconds")
-    print(f"Output saved to: {output_file}")
-    
-    # Cleanup
-    generator.shutdown()
+    benchmark_results = {}
+
+    for backend, label, suffix in experiments:
+        print(f"\n{'='*50}")
+        print(f" Running Inference with {label} Backend")
+        print(f"{'='*50}")
+        
+        # Determine output filename for this run
+        current_filename = args.output_filename
+        if suffix:
+            import os
+            name, ext = os.path.splitext(current_filename)
+            current_filename = f"{name}{suffix}{ext}"
+        
+        current_output_path = os.path.join(args.output_path, current_filename)
+
+        # Create generator
+        try:
+            generator = DiffGenerator.from_pretrained(
+                model_path=args.model_path,
+                num_gpus=args.num_gpus,
+                ulysses_degree=args.ulysses_degree,
+                ring_degree=args.ring_degree,
+                attention_backend=backend,
+                text_encoder_cpu_offload=args.text_encoder_cpu_offload,
+                pin_cpu_memory=args.pin_cpu_memory,
+            )
+        except Exception as e:
+            print(f"Failed to initialize generator with {backend}: {e}")
+            continue
+
+        # Generate video
+        print("\nStarting generation...")
+        import time
+        import gc
+        import torch
+        
+        # Clear cache before generation
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        
+        start_time = time.time()
+        
+        try:
+            result = generator.generate(
+                sampling_params_kwargs=dict(
+                    prompt=args.prompt,
+                    negative_prompt=args.negative_prompt,
+                    image_path=args.image_path,  # Use image_path, not image
+                    height=height,
+                    width=width,
+                    num_inference_steps=args.num_inference_steps,
+                    seed=args.seed,
+                    fps=args.fps,
+                    output_path=args.output_path,
+                    output_file_name=current_filename,
+                    save_output=True,
+                    return_frames=False,
+                )
+            )
+            
+            # Sync for accurate timing
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                
+            end_time = time.time()
+            elapsed = end_time - start_time
+            
+            print(f"\n{label} Generation completed in {elapsed:.2f} seconds")
+            print(f"Output saved to: {current_output_path}")
+            
+            benchmark_results[label] = elapsed
+            
+        except Exception as e:
+            print(f"Generation failed with {backend}: {e}")
+        
+        # Cleanup
+        generator.shutdown()
+        del generator
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # Print Comparison Summary
+    if args.compare_with_dense and len(benchmark_results) > 1:
+        print("\n" + "=" * 70)
+        print(" Performance Comparison Summary")
+        print("=" * 70)
+        print(f" {'Method':<25} | {'Time (s)':<10} | {'Speedup':<10}")
+        print("-" * 70)
+        
+        dense_time = benchmark_results.get("Dense (FlashAttn2)", float('inf'))
+        
+        for label, duration in benchmark_results.items():
+            if label == "Dense (FlashAttn2)":
+                speedup_str = "1.00x"
+            else:
+                speedup = dense_time / duration if duration > 0 else 0
+                speedup_str = f"{speedup:.2f}x"
+            
+            print(f" {label:<25} | {duration:<10.2f} | {speedup_str:<10}")
+        print("=" * 70)
 
 
 if __name__ == "__main__":
