@@ -30,21 +30,24 @@ def benchmark_fn(fn: Callable, warmup: int = 2, repeat: int = 5, sync: bool = Tr
     for _ in range(warmup):
         try:
             fn()
-        except RuntimeError:
-            return float('inf') # Fail fast on OOM during warmup
+        except (RuntimeError, Exception) as e:
+            return float('inf') # Fail fast on OOM/error during warmup
             
     if sync and torch.cuda.is_available():
         torch.cuda.synchronize()
     
     # Benchmark
-    start = time.perf_counter()
-    for _ in range(repeat):
-        fn()
-    
-    if sync and torch.cuda.is_available():
-        torch.cuda.synchronize()
-    
-    return (time.perf_counter() - start) / repeat * 1000
+    try:
+        start = time.perf_counter()
+        for _ in range(repeat):
+            fn()
+        
+        if sync and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        
+        return (time.perf_counter() - start) / repeat * 1000
+    except (RuntimeError, Exception):
+        return float('inf')
 
 def print_header(title: str):
     print("\n" + "=" * 80)
@@ -59,7 +62,17 @@ def import_svg2_components():
     from sglang.multimodal_gen.runtime.layers.attention.backends.svg2_sparse_attn import (
         svg2_attention_forward,
     )
-    return {'svg2_attention_forward': svg2_attention_forward}
+    
+    # Try importing official FlashAttention
+    try:
+        from flash_attn import flash_attn_func
+    except ImportError:
+        flash_attn_func = None
+    
+    return {
+        'svg2_attention_forward': svg2_attention_forward,
+        'flash_attn_func': flash_attn_func
+    }
 
 # ============================================================================
 # Baselines
@@ -101,12 +114,15 @@ def run_model_benchmark(
     print("-" * 80)
 
     # 1. Prepare Data
+    torch.cuda.empty_cache()  # Clean up before allocating
     try:
         q = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
         k = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
         v = torch.randn(B, S, H, D, device=device, dtype=torch.float16)
+        torch.cuda.synchronize()  # Ensure allocation succeeded
     except RuntimeError as e:
-        print(f"  Skipping: OOM during tensor allocation. {e}")
+        print(f"  Skipping: {e}")
+        torch.cuda.empty_cache()
         return
 
     # 2. Run Baselines
@@ -123,7 +139,7 @@ def run_model_benchmark(
             dense_ms = float('inf')
             print("OOM")
 
-    # SDPA (FlashAttention)
+    # SDPA (FlashAttention-backend)
     print(f"  Running Torch SDPA (FlashAttn)...  ", end="", flush=True)
     try:
         sdpa_ms = benchmark_fn(lambda: torch_sdpa_attention(q, k, v))
@@ -131,6 +147,23 @@ def run_model_benchmark(
     except RuntimeError:
         sdpa_ms = float('inf')
         print("OOM")
+    
+    # FlashAttention (Official Library)
+    flash_ms = float('inf')
+    if svg2_components.get('flash_attn_func') is not None:
+        print(f"  Running FlashAttn (Dao-AILab)...   ", end="", flush=True)
+        try:
+            flash_fn = svg2_components['flash_attn_func']
+            scale = 1.0 / math.sqrt(D)
+            flash_ms = benchmark_fn(
+                lambda: flash_fn(q, k, v, dropout_p=0.0, softmax_scale=scale, causal=False)
+            )
+            print(f"{flash_ms:.2f} ms")
+        except Exception as e:
+            flash_ms = float('inf')
+            print(f"Error: {e}")
+    else:
+        print(f"  FlashAttn (Dao-AILab): Not available")
 
     # 3. Run SVG2 Configurations
     # Settings from Paper: Cq=100, Ck=500 (Section D)
@@ -144,9 +177,18 @@ def run_model_benchmark(
         (0.9, 128, 512, 32), 
     ]
 
+    print("\n  Baseline Summary:")
+    print(f"    {'Method':30s} | {'Time (ms)':>12s}")
+    print("    " + "-" * 44)
+    if dense_ms != float('inf'):
+        print(f"    {'Torch Dense':30s} | {dense_ms:12.2f}")
+    print(f"    {'Torch SDPA':30s} | {sdpa_ms:12.2f}")
+    if flash_ms != float('inf'):
+        print(f"    {'FlashAttn (Dao-AILab)':30s} | {flash_ms:12.2f}")
+    
     print("\n  SVG2 Results:")
-    print(f"    {'Setting':40s} | {'Time (ms)':>12s} | {'vs SDPA':>12s} | {'vs Dense':>12s}")
-    print("    " + "-" * 76)
+    print(f"    {'Setting':40s} | {'Time (ms)':>12s} | {'vs FlashAttn':>12s} | {'vs SDPA':>12s}")
+    print("    " + "-" * 78)
 
     for top_p, qc, kc, cap in configs:
         desc = f"P={top_p}, Qc={qc}, Kc={kc}"
@@ -167,21 +209,25 @@ def run_model_benchmark(
                 )
             )
             
-            # Formatting
+            # Formatting vs FlashAttn
+            speedup_flash = flash_ms / svg2_ms if svg2_ms > 0 and flash_ms != float('inf') else 0
+            if speedup_flash > 1: vs_flash_str = f"{speedup_flash:.2f}x faster"
+            elif speedup_flash > 0: vs_flash_str = f"{1/speedup_flash:.2f}x slower"
+            else: vs_flash_str = "N/A"
+            
+            # Formatting vs SDPA
             speedup_sdpa = sdpa_ms / svg2_ms if svg2_ms > 0 and sdpa_ms != float('inf') else 0
             if speedup_sdpa > 1: vs_sdpa_str = f"{speedup_sdpa:.2f}x faster"
             elif speedup_sdpa > 0: vs_sdpa_str = f"{1/speedup_sdpa:.2f}x slower"
             else: vs_sdpa_str = "N/A"
 
-            speedup_dense = dense_ms / svg2_ms if svg2_ms > 0 and dense_ms != float('inf') else 0
-            if speedup_dense > 1: vs_dense_str = f"{speedup_dense:.2f}x faster"
-            elif dense_ms == float('inf'): vs_dense_str = "        Inf"
-            else: vs_dense_str = f"{1/speedup_dense:.2f}x slower"
-
-            print(f"    {desc:40s} | {svg2_ms:12.2f} | {vs_sdpa_str:>12s} | {vs_dense_str:>12s}")
+            print(f"    {desc:40s} | {svg2_ms:12.2f} | {vs_flash_str:>12s} | {vs_sdpa_str:>12s}")
 
         except RuntimeError as e:
             print(f"    {desc:40s} |        Error | {str(e)}")
+    
+    # Cleanup after benchmark
+    torch.cuda.empty_cache()
 
 # ============================================================================
 # Main
