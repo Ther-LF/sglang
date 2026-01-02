@@ -406,10 +406,23 @@ def benchmark_full_attention(
             vs_dense = torch_dense_time / svg2_time if svg2_time > 0 and torch_dense_time != float('inf') else 0
             vs_sdpa = torch_sdpa_time / svg2_time if svg2_time > 0 else 0
             
-            vs_dense_str = f"{vs_dense:.2f}x faster" if vs_dense > 1 else f"{1/vs_dense:.2f}x slower"
-            if torch_dense_time == float('inf'): vs_dense_str = "        Inf"
+            if torch_dense_time == float('inf'):
+                vs_dense_str = "        Inf"
+            elif vs_dense > 1:
+                vs_dense_str = f"{vs_dense:.2f}x faster"
+            elif vs_dense > 0:
+                vs_dense_str = f"{1/vs_dense:.2f}x slower"
+            else:
+                vs_dense_str = "        N/A"
             
-            vs_sdpa_str = f"{vs_sdpa:.2f}x faster" if vs_sdpa > 1 else f"{1/vs_sdpa:.2f}x slower"
+            if vs_sdpa > 1:
+                vs_sdpa_str = f"{vs_sdpa:.2f}x faster"
+            elif vs_sdpa > 0:
+                vs_sdpa_str = f"{1/vs_sdpa:.2f}x slower"
+            else:
+                vs_sdpa_str = "        N/A"
+
+            if torch_dense_time == float('inf'): vs_dense_str = "        Inf"
             
             sparsity = (1 - top_p) * 100
             method_name = f"SVG2 (p={top_p}, K={scaled_clusters}, tk={max_k_per_q_eff})"
