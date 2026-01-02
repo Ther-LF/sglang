@@ -134,13 +134,14 @@ def run_model_benchmark(
 
     # 3. Run SVG2 Configurations
     # Settings from Paper: Cq=100, Ck=500 (Section D)
+    # Note: Triton requires power-of-2, so using 128 and 512
     configs = [
         # (Top-P, QC, KC, Max_K_per_Q)
-        (0.5, 100, 500, None), 
-        (0.7, 100, 500, None),
-        (0.9, 100, 500, None), 
+        (0.5, 128, 512, None), 
+        (0.7, 128, 512, None),
+        (0.9, 128, 512, None), 
         # Add a "Turbo" setting with cap
-        (0.9, 100, 500, 32), 
+        (0.9, 128, 512, 32), 
     ]
 
     print("\n  SVG2 Results:")
