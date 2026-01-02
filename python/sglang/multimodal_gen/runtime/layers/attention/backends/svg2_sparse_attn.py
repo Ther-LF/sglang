@@ -350,10 +350,12 @@ def _inverse_permute_kernel(
 
 def permute_by_labels(
     x: torch.Tensor,  # [B, H, S, D]
-    labels: torch.Tensor,  # [B*H, S]
+    labels: Optional[torch.Tensor] = None,  # [B*H, S]
+    sorted_indices: Optional[torch.Tensor] = None,  # [B*H, S]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Permute tensor by cluster labels (sort tokens by cluster).
+    Optionally accepts pre-computed sorted_indices to avoid re-sorting.
     
     Returns:
         permuted_x: Permuted tensor [B, H, S, D]
@@ -364,7 +366,11 @@ def permute_by_labels(
     device = x.device
     
     # Get sorted indices
-    sorted_indices = torch.argsort(labels, dim=-1).to(torch.int32).contiguous()
+    if sorted_indices is None:
+        assert labels is not None, "Either labels or sorted_indices must be provided"
+        sorted_indices = torch.argsort(labels, dim=-1).to(torch.int32).contiguous()
+    else:
+        sorted_indices = sorted_indices.to(torch.int32).contiguous()
     
     # Flatten and permute
     x_flat = x.reshape(BH, S, D).contiguous()
@@ -440,46 +446,53 @@ def identify_dynamic_mask(
     Kk = k_centroids.shape[2]
     device = q_centroids.device
     
-    # Compute attention scores between centroids
-    # scores[b, h, i, j] = q_centroids[b, h, i] @ k_centroids[b, h, j].T / sqrt(D)
+    # 1. Compute attention scores: (Q @ K.T) / sqrt(D)
     scale = 1.0 / math.sqrt(D)
+    # [B, H, Kq, D] @ [B, H, Kk, D].T -> [B, H, Kq, Kk]
     scores = torch.einsum('bhqd,bhkd->bhqk', q_centroids.float(), k_centroids.float()) * scale
     
-    # Weight by cluster sizes (larger clusters are more important)
-    weights = q_cluster_sizes[:, :, :, None].float() * k_cluster_sizes[:, :, None, :].float()
-    weighted_scores = scores * weights
-
-    # Optional per-query top-k cap to bound active blocks and improve latency
+    # 2. Weight scores by Key cluster sizes (Importance of Key)
+    # Note: SVG original logic weights by K size, not Q*K size
+    k_weights = k_cluster_sizes.unsqueeze(-2).float() # [B, H, 1, Kk]
+    
+    # 3. Weighted Softmax per Query (Row-wise)
+    # This computes probability distribution of attention for each Query cluster
+    max_score = torch.max(scores, dim=-1, keepdim=True)[0]
+    exp_scores = torch.exp(scores - max_score)
+    weighted_exp = k_weights * exp_scores
+    weighted_probs = weighted_exp / torch.sum(weighted_exp, dim=-1, keepdim=True).clamp(min=1e-12)
+    
+    # 4. Optional Top-K cap (Optimization for speed)
     if max_k_clusters_per_q is not None:
-        target_k = max(1, int(math.ceil(top_p * Kk)))
-        target_k = min(target_k, max_k_clusters_per_q, Kk)
-        # Select top-k key clusters for each query cluster
-        _, topk_idx = torch.topk(weighted_scores, k=target_k, dim=-1)
+        target_k = min(max_k_clusters_per_q, Kk)
+        _, topk_idx = torch.topk(weighted_probs, k=target_k, dim=-1)
         block_mask = torch.zeros((B, H, Kq, Kk), device=device, dtype=torch.bool)
         block_mask.scatter_(-1, topk_idx, True)
         return block_mask
+
+    # 5. Sort by probability (Descending)
+    sorted_probs, sorted_indices = torch.sort(weighted_probs, dim=-1, descending=True)
     
-    # Softmax to get importance
-    importance = torch.softmax(weighted_scores.reshape(B, H, -1), dim=-1)
-    importance = importance.reshape(B, H, Kq, Kk)
+    # 6. Cumulative Sum to find Top-P cutoff
+    cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
     
-    # Determine threshold for top-p
-    flat_importance = importance.reshape(B * H, -1)
-    sorted_imp, _ = torch.sort(flat_importance, dim=-1, descending=True)
-    cumsum = torch.cumsum(sorted_imp, dim=-1)
+    # 7. Determine which to remove
+    # Logic: remove if cumsum > p, but keep the first one that crosses the threshold
+    # SVG logic: remove_indices = cumsum > p; shift right; keep first
+    remove_indices = cumsum_probs > top_p
+    remove_indices[..., 1:] = remove_indices[..., :-1].clone()
+    remove_indices[..., 0] = False # Always keep at least the most important one
     
-    # Find cutoff index
-    cutoff_mask = cumsum <= top_p
-    num_keep = cutoff_mask.sum(dim=-1).clamp(min=max(1, int(min_kc_ratio * Kq * Kk)))
+    # 8. Min Ratio Protection
+    if min_kc_ratio > 0:
+        preserve_length = int(min_kc_ratio * Kk)
+        remove_indices[..., :preserve_length] = False
+        
+    sorted_clusters_to_keep = ~remove_indices
     
-    # Create mask
-    threshold = torch.zeros(B * H, device=device)
-    for i in range(B * H):
-        if num_keep[i] < Kq * Kk:
-            threshold[i] = sorted_imp[i, num_keep[i]]
-    
-    threshold = threshold.reshape(B, H, 1, 1)
-    block_mask = importance >= threshold
+    # 9. Map back to original indices
+    block_mask = torch.zeros((B, H, Kq, Kk), device=device, dtype=torch.bool)
+    block_mask.scatter_(-1, sorted_indices, sorted_clusters_to_keep)
     
     return block_mask
 
@@ -851,9 +864,9 @@ def svg2_attention_forward(
     )
     
     # Step 3: Permute Q, K, V by cluster labels
-    q_perm, q_sorted_indices = permute_by_labels(q, q_labels)
-    k_perm, k_sorted_indices = permute_by_labels(k, k_labels)
-    v_perm, _ = permute_by_labels(v, k_labels)
+    q_perm, q_sorted_indices = permute_by_labels(q, labels=q_labels)
+    k_perm, k_sorted_indices = permute_by_labels(k, labels=k_labels)
+    v_perm, _ = permute_by_labels(v, sorted_indices=k_sorted_indices)
     
     # Step 4: Block sparse attention
     out_perm = block_sparse_attention(
