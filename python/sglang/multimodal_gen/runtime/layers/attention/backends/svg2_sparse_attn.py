@@ -507,320 +507,378 @@ def identify_dynamic_mask(
 # ============================================================================
 
 
+# ============================================================================
+# 1. Planning Kernel (Index Expansion)
+# ============================================================================
 @triton.jit
 def _kv_index_expansion_kernel(
-    # Input: Active K Blocks info
-    k_base_id_ptr,    # [Num_Active_Blocks] 每个活跃块在 K tensor 中的起始 Token ID (Global)
-    k_lengths_ptr,    # [Num_Active_Blocks] 每个活跃块的长度
-    
-    # Input: Write offsets
-    write_offset_ptr, # [Num_Active_Blocks] 这个块应该写在 output list 的第几个位置
-    
-    # Output: Flattened Indices
-    out_indices_ptr,  # [Total_Active_K_Tokens] 最终的索引清单
-    
+    base_id_ptr, length_ptr, write_off_ptr, out_idx_ptr,
     MAX_BLOCK_SIZE: tl.constexpr
 ):
-    """
-    Planning Phase Kernel:
-    Expands (Base, Length) tuples into a flat list of token indices: [Base, Base+1, ... Base+Len-1].
-    """
     pid = tl.program_id(0)
+    base = tl.load(base_id_ptr + pid)
+    length = tl.load(length_ptr + pid)
+    write_off = tl.load(write_off_ptr + pid)
     
-    # 1. Read Block Metadata
-    base_id = tl.load(k_base_id_ptr + pid)
-    length = tl.load(k_lengths_ptr + pid)
-    write_start = tl.load(write_offset_ptr + pid)
-    
-    # 2. Generate offsets [0, 1, 2, ... MAX]
     offs = tl.arange(0, MAX_BLOCK_SIZE)
     mask = offs < length
-    
-    # 3. Compute Physical Indices
-    vals = base_id + offs
-    
-    # 4. Write to flattened list
-    tl.store(out_indices_ptr + write_start + offs, vals, mask=mask)
+    tl.store(out_idx_ptr + write_off + offs, base + offs, mask=mask)
 
-
+# ============================================================================
+# 2. Phase 1: Split-K Compute Kernel
+# ============================================================================
 @triton.jit
-def _compute_attn_kernel(
-    Q, K, V, Out,
+def _split_k_compute_kernel(
+    Q, K, V,
+    # Outputs to Intermediate Buffers
+    Tmp_Acc, # [Num_Tasks, SPLIT_K, BLOCK_M, D]
+    Tmp_M,   # [Num_Tasks, SPLIT_K, BLOCK_M]
+    Tmp_L,   # [Num_Tasks, SPLIT_K, BLOCK_M]
     
-    # === Indirection Buffers (The "List") ===
-    kv_indices_ptr,   # [Total_K_Tokens] All active K Token physical indices
+    # Indirection Lists
+    kv_indices_ptr,
+    task_k_start_ptr, task_k_end_ptr, # Per-Task K bounds
     
-    # === Task Metadata (Load Balancing) ===
-    task_k_start_ptr, # [Num_Tasks] Start index in kv_indices for this task
-    task_k_end_ptr,   # [Num_Tasks] End index in kv_indices for this task
+    # Task Metadata
+    task_q_base_ptr, task_q_len_ptr,
     
-    task_q_base_ptr,  # [Num_Tasks] Q Physical Token Base ID for this task
-    task_q_len_ptr,   # [Num_Tasks] Length of Q chunk for this task
-    
-    # === Strides ===
+    # Strides
     stride_qb, stride_qh, stride_qs, stride_qd,
     stride_kb, stride_kh, stride_ks, stride_kd,
     stride_vb, stride_vh, stride_vs, stride_vd,
-    stride_ob, stride_oh, stride_os, stride_od,
+    stride_tmp_t, stride_tmp_s, stride_tmp_m, stride_tmp_d, # Strides for intermediate buffers
+    stride_m_t, stride_m_s, # Strides for Tmp_M/L
     
-    # === Constants ===
-    sm_scale,
-    BLOCK_M: tl.constexpr, 
-    BLOCK_N: tl.constexpr, 
-    BLOCK_D: tl.constexpr,
+    # Config
+    sm_scale, SPLIT_K,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr
 ):
-    """
-    Running Phase Kernel:
-    Computes attention using Indirect Access (Gather K/V from list) and Load Balancing (Tiled Q).
-    """
-    # 1. Get Task ID
+    # Grid: (Num_Tasks * SPLIT_K)
+    # PID layout: [Task_0_Split_0, Task_0_Split_1, ..., Task_1_Split_0...]
     pid = tl.program_id(0)
     
-    # 2. Get Q Info
-    q_phys_base = tl.load(task_q_base_ptr + pid)
-    q_len = tl.load(task_q_len_ptr + pid)
+    task_id = pid // SPLIT_K
+    split_id = pid % SPLIT_K
     
-    # 3. Get K List Range
-    k_list_start = tl.load(task_k_start_ptr + pid)
-    k_list_end = tl.load(task_k_end_ptr + pid)
+    # 1. Load Task Info
+    q_len = tl.load(task_q_len_ptr + task_id)
+    k_list_start = tl.load(task_k_start_ptr + task_id)
+    k_list_end = tl.load(task_k_end_ptr + task_id)
     
-    if k_list_end == k_list_start:
+    total_k_work = k_list_end - k_list_start
+    if total_k_work <= 0:
+        # Initialize L=0, M=-inf for safety in reduction
+        offs_m = tl.arange(0, BLOCK_M)
+        mask_m = offs_m < q_len
+        # Pointers for M/L
+        m_ptr = Tmp_M + task_id * stride_m_t + split_id * stride_m_s + offs_m
+        l_ptr = Tmp_L + task_id * stride_m_t + split_id * stride_m_s + offs_m
+        tl.store(m_ptr, -float('inf'), mask=mask_m)
+        tl.store(l_ptr, 0.0, mask=mask_m)
         return
 
-    # 4. Load Q Tile
+    # 2. Determine K range for THIS split
+    # Divide total work evenly among splits
+    # chunks_total = ceil(total_k_work / BLOCK_N)
+    # chunks_per_split = ceil(chunks_total / SPLIT_K)
+    # To keep it simple: just divide ranges
+    
+    work_per_split = (total_k_work + SPLIT_K - 1) // SPLIT_K
+    # Ensure aligned to BLOCK_N? Not strictly necessary for correctness, but good for perf.
+    # Let's just iterate linearly.
+    
+    my_k_start = k_list_start + split_id * work_per_split
+    my_k_end = min(k_list_end, my_k_start + work_per_split)
+    
+    if my_k_start >= my_k_end:
+        # No work for this split
+        offs_m = tl.arange(0, BLOCK_M)
+        mask_m = offs_m < q_len
+        m_ptr = Tmp_M + task_id * stride_m_t + split_id * stride_m_s + offs_m
+        l_ptr = Tmp_L + task_id * stride_m_t + split_id * stride_m_s + offs_m
+        tl.store(m_ptr, -float('inf'), mask=mask_m)
+        tl.store(l_ptr, 0.0, mask=mask_m)
+        return
+
+    # 3. Load Q Tile
+    q_phys_base = tl.load(task_q_base_ptr + task_id)
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_D)
     
-    # Q ptr = Q_Base + (Global_Q_Token_ID * stride_qs) + (Offs_D * stride_qd)
-    # Note: stride_qd is usually 1
-    q_ptr = Q + q_phys_base * stride_qs + offs_m[:, None] * stride_qs + offs_d[None, :] * stride_qd
+    q_ptr = Q + q_phys_base * stride_qs + offs_m[:, None] * stride_qs + offs_d[None, :]
     q_mask = (offs_m[:, None] < q_len) & (offs_d[None, :] < BLOCK_D)
     q_tile = tl.load(q_ptr, mask=q_mask, other=0.0)
     
-    # 5. Initialize Accumulators
+    # 4. Initialize Accumulators
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
     
-    # 6. Core Loop: Linear Scan over Indirection List
-    for start_idx in range(k_list_start, k_list_end, BLOCK_N):
-        # Current chunk length
-        actual_block_n = min(BLOCK_N, k_list_end - start_idx)
+    # 5. Compute Loop (Standard FlashAttention)
+    offs_n = tl.arange(0, BLOCK_N)
+    
+    for k_idx in range(my_k_start, my_k_end, BLOCK_N):
+        current_block_n = min(BLOCK_N, my_k_end - k_idx)
         
-        offs_n = tl.arange(0, BLOCK_N)
-        chunk_mask = offs_n < actual_block_n
+        # Indirect Load K Indices
+        k_phys_ids = tl.load(kv_indices_ptr + k_idx + offs_n, mask=offs_n < current_block_n, other=0)
         
-        # === Indirect Access ===
-        # 1. Load K Physical IDs from List
-        current_indices_ptr = kv_indices_ptr + start_idx + offs_n
-        k_phys_ids = tl.load(current_indices_ptr, mask=chunk_mask, other=0)
+        # Indirect Load K/V
+        k_ptrs = K + k_phys_ids[:, None] * stride_ks + offs_d[None, :]
+        v_ptrs = V + k_phys_ids[:, None] * stride_vs + offs_d[None, :]
         
-        # 2. Compute K/V Pointers (Gather)
-        # K ptr = K_Base + (Global_K_Token_ID * stride_ks) + (Offs_D * stride_kd)
-        k_ptrs = K + k_phys_ids[:, None] * stride_ks + offs_d[None, :] * stride_kd
-        v_ptrs = V + k_phys_ids[:, None] * stride_vs + offs_d[None, :] * stride_vd
-        
-        load_mask = chunk_mask[:, None] & (offs_d[None, :] < BLOCK_D)
+        load_mask = (offs_n[:, None] < current_block_n) & (offs_d[None, :] < BLOCK_D)
         k_tile = tl.load(k_ptrs, mask=load_mask, other=0.0)
         v_tile = tl.load(v_ptrs, mask=load_mask, other=0.0)
         
-        # === Attention Computation ===
-        # QK^T
+        # Attn
         qk = tl.dot(q_tile, tl.trans(k_tile))
         qk *= sm_scale
+        qk = tl.where(offs_n[None, :] < current_block_n, qk, float("-inf"))
         
-        # Masking
-        qk = tl.where(chunk_mask[None, :], qk, float("-inf"))
-        
-        # Online Softmax
         m_curr = tl.max(qk, 1)
         m_new = tl.maximum(m_i, m_curr)
         p = tl.exp(qk - m_new[:, None])
         alpha = tl.exp(m_i - m_new)
-        
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_new
         
-        # Accumulate
         p = p.to(v_tile.dtype)
         acc = acc * alpha[:, None] + tl.dot(p, v_tile)
-        
-    # 7. Finalize and Store
-    l_i_safe = tl.where(l_i == 0, 1.0, l_i)
-    acc = acc / l_i_safe[:, None]
-    acc = tl.where(l_i[:, None] == 0, 0.0, acc)
     
-    out_ptr = Out + q_phys_base * stride_os + offs_m[:, None] * stride_os + offs_d[None, :] * stride_od
-    out_mask = (offs_m[:, None] < q_len) & (offs_d[None, :] < BLOCK_D)
-    tl.store(out_ptr, acc.to(Out.dtype.element_ty), mask=out_mask)
+    # 6. Store Intermediate Results (No Normalization yet)
+    # Tmp Buffers are [Num_Tasks, SPLIT_K, BLOCK_M, D]
+    
+    # Store M
+    m_out_ptr = Tmp_M + task_id * stride_m_t + split_id * stride_m_s + offs_m
+    tl.store(m_out_ptr, m_i, mask=offs_m < q_len)
+    
+    # Store L
+    l_out_ptr = Tmp_L + task_id * stride_m_t + split_id * stride_m_s + offs_m
+    tl.store(l_out_ptr, l_i, mask=offs_m < q_len)
+    
+    # Store Acc
+    # 3D offsets for Acc: [task, split, m, d]
+    acc_out_ptr = Tmp_Acc + task_id * stride_tmp_t + split_id * stride_tmp_s + \
+                  offs_m[:, None] * stride_tmp_m + offs_d[None, :] * stride_tmp_d
+    
+    tl.store(acc_out_ptr, acc.to(Tmp_Acc.dtype.element_ty), mask=q_mask)
 
+
+# ============================================================================
+# 3. Phase 2: Reduction Kernel
+# ============================================================================
+@triton.jit
+def _split_k_reduce_kernel(
+    Out,
+    Tmp_Acc, Tmp_M, Tmp_L,
+    
+    # Task Metadata to find write location
+    task_q_base_ptr, task_q_len_ptr,
+    
+    # Strides
+    stride_os, stride_od,
+    stride_tmp_t, stride_tmp_s, stride_tmp_m, stride_tmp_d,
+    stride_m_t, stride_m_s,
+    
+    SPLIT_K: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr
+):
+    # Grid: (Num_Tasks)
+    # Each program merges results for one Q Tile
+    task_id = tl.program_id(0)
+    
+    q_len = tl.load(task_q_len_ptr + task_id)
+    q_phys_base = tl.load(task_q_base_ptr + task_id)
+    
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_m = offs_m < q_len
+    
+    # 1. Find Global Max (M_global) across all splits
+    # Logic: M_global = max(M_0, M_1, ... M_k)
+    m_global = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    
+    for s in range(SPLIT_K):
+        m_ptr = Tmp_M + task_id * stride_m_t + s * stride_m_s + offs_m
+        m_s = tl.load(m_ptr, mask=mask_m, other=-float("inf"))
+        m_global = tl.maximum(m_global, m_s)
+        
+    # 2. Compute Global Sum (L_global) and Weighted Acc
+    # L_global = sum(L_s * exp(M_s - M_global))
+    # Acc_global = sum(Acc_s * exp(M_s - M_global))
+    
+    l_global = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc_global = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+    
+    for s in range(SPLIT_K):
+        # Load M, L for split s
+        m_ptr = Tmp_M + task_id * stride_m_t + s * stride_m_s + offs_m
+        l_ptr = Tmp_L + task_id * stride_m_t + s * stride_m_s + offs_m
+        
+        m_s = tl.load(m_ptr, mask=mask_m, other=-float("inf"))
+        l_s = tl.load(l_ptr, mask=mask_m, other=0.0)
+        
+        # Load Acc for split s
+        acc_ptr = Tmp_Acc + task_id * stride_tmp_t + s * stride_tmp_s + \
+                  offs_m[:, None] * stride_tmp_m + offs_d[None, :] * stride_tmp_d
+        
+        acc_s = tl.load(acc_ptr, mask=mask_m[:, None] & (offs_d[None, :] < BLOCK_D), other=0.0)
+        
+        # Rescale factor
+        alpha = tl.exp(m_s - m_global)
+        
+        l_global += l_s * alpha
+        acc_global += acc_s * alpha[:, None]
+        
+    # 3. Normalize and Write
+    l_safe = tl.where(l_global == 0, 1.0, l_global)
+    out_val = acc_global / l_safe[:, None]
+    out_val = tl.where(l_global[:, None] == 0, 0.0, out_val)
+    
+    out_base = Out + q_phys_base * stride_os
+    out_offsets = offs_m[:, None] * stride_os + offs_d[None, :]
+    tl.store(out_base + out_offsets, out_val.to(Out.dtype.element_ty), 
+             mask=mask_m[:, None] & (offs_d[None, :] < BLOCK_D))
+
+
+
+# ============================================================================
+# 4. Main Function: Block Sparse Attn with Split-K
+# ============================================================================
 
 def block_sparse_attention(
-    q: torch.Tensor,           # [B, H, S, D]
-    k: torch.Tensor,           # [B, H, S, D]
-    v: torch.Tensor,           # [B, H, S, D]
-    block_mask: torch.Tensor,  # [B, H, Kq, Kk]
-    q_cluster_sizes: torch.Tensor,  # [B, H, Kq]
-    k_cluster_sizes: torch.Tensor,  # [B, H, Kk]
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    block_mask: torch.Tensor,
+    q_cluster_sizes: torch.Tensor,
+    k_cluster_sizes: torch.Tensor,
+    split_k: int = 4 # 默认 Split-K 因子，可调
 ) -> torch.Tensor:
-    """
-    FlashInfer-style implementation of Block Sparse Attention.
     
-    Phase 1: Planning (Index Expansion on GPU)
-    Phase 2: Scheduling (Load Balancing)
-    Phase 3: Running (Compute)
-    """
     B, H, S, D = q.shape
     QC = q_cluster_sizes.shape[-1]
     KC = k_cluster_sizes.shape[-1]
     device = q.device
     
-    # Kernel Config
-    BLOCK_M = 64 # Q Tile Size (Load Balancing Unit)
-    BLOCK_N = 64 # K Chunk Size
+    BLOCK_M = 64
+    BLOCK_N = 64
     BLOCK_D = triton.next_power_of_2(D)
     
-    # ========================================================================
-    # PHASE 1: PLANNING (Metadata Generation)
-    # ========================================================================
+    # === PLANNING PHASE ===
     
-    # 1.1 Calculate Cumulative Sizes (Offset Map)
-    # [B, H, QC+1]
+    # 1. CSR Indices Generation (Same as before)
+    flat_mask = block_mask.view(-1, KC)
+    sparse_mask = flat_mask.float().to_sparse_csr()
+    q_blk_indptr = sparse_mask.crow_indices().int()
+    k_blk_indices = sparse_mask.col_indices().int()
+    
+    # Calculate global offsets for K blocks
     qc_offsets = torch.zeros((B, H, QC + 1), device=device, dtype=torch.int32)
     qc_offsets[..., 1:] = torch.cumsum(q_cluster_sizes, dim=-1)
-    
     kc_offsets = torch.zeros((B, H, KC + 1), device=device, dtype=torch.int32)
     kc_offsets[..., 1:] = torch.cumsum(k_cluster_sizes, dim=-1)
     
-    # 1.2 Identify Active Pairs (The "Order")
-    # [B*H*QC, KC]
-    flat_mask = block_mask.view(-1, KC)
-    # Use PyTorch CSR for fast indptr generation
-    sparse_mask = flat_mask.float().to_sparse_csr()
-    
-    # crow_indices: [B*H*QC + 1]
-    q_blk_indptr = sparse_mask.crow_indices().int() 
-    # col_indices: [NNZ]
-    k_blk_indices = sparse_mask.col_indices().int()
-    
-    NNZ = k_blk_indices.numel()
-    
-    # 1.3 Expand K Indices (The "KV Index Kernel")
-    # Recover (b, h) for each active entry in kv_indices
+    # Expand active K lists (Index Expansion Kernel)
+    # Logic: Flatten B/H/KC to find global K offsets
     active_counts = q_blk_indptr[1:] - q_blk_indptr[:-1]
-    
-    # [NNZ] -> Global Q Cluster ID (0...B*H*QC-1)
     q_global_ids = torch.repeat_interleave(torch.arange(B*H*QC, device=device, dtype=torch.int32), active_counts)
-    
     batch_ids = q_global_ids // (H * QC)
     head_ids = (q_global_ids // QC) % H
     
-    # Flatten kc_offsets to [B*H, KC+1] to use advanced indexing
     flat_kc_offsets = kc_offsets.view(B*H, KC+1)
     bh_ids = batch_ids * H + head_ids
     
-    active_k_starts = flat_kc_offsets[bh_ids, k_blk_indices] # [NNZ] (relative to S)
-    active_k_ends = flat_kc_offsets[bh_ids, k_blk_indices + 1] # [NNZ]
-    active_k_lengths = active_k_ends - active_k_starts # [NNZ]
-    
-    # Calculate Global Base Address for K (Token Level)
-    # Global_Offset = (b*H + h)*S + start
+    active_k_starts = flat_kc_offsets[bh_ids, k_blk_indices]
+    active_k_ends = flat_kc_offsets[bh_ids, k_blk_indices + 1]
+    active_k_lengths = active_k_ends - active_k_starts
     global_k_offsets = bh_ids * S + active_k_starts
     
-    # Allocate the "List"
+    NNZ = active_k_lengths.numel()
     total_active_k_tokens = active_k_lengths.sum().item()
-    kv_indices = torch.empty(total_active_k_tokens, device=device, dtype=torch.int64)
     
-    # Calculate write offsets for the list
+    kv_indices = torch.empty(total_active_k_tokens, device=device, dtype=torch.int64)
     write_offsets = torch.zeros(NNZ + 1, device=device, dtype=torch.int32)
     write_offsets[1:] = torch.cumsum(active_k_lengths, dim=0)
     
-    # Launch Triton Index Expansion
     if NNZ > 0:
         max_len = int(active_k_lengths.max().item())
-        # Safe guard for max_len=0
-        if max_len > 0:
-            grid_plan = (NNZ,)
-            _kv_index_expansion_kernel[grid_plan](
-                global_k_offsets,   # Base IDs
-                active_k_lengths,   # Lengths
-                write_offsets,      # Where to write
-                kv_indices,         # Output buffer
-                triton.next_power_of_2(max_len)
-            )
+        _kv_index_expansion_kernel[(NNZ,)](
+            global_k_offsets, active_k_lengths, write_offsets, kv_indices, 
+            triton.next_power_of_2(max_len)
+        )
     
-    # ========================================================================
-    # PHASE 2: SCHEDULING (Load Balancing / Tiling)
-    # ========================================================================
-    
-    # 2.1 Calculate tiles per Q Cluster
-    # q_cluster_sizes: [B, H, QC] -> [B*H*QC]
+    # 2. Scheduling (Q-Tiling + Task Mapping)
     flat_q_sizes = q_cluster_sizes.view(-1)
     tiles_per_q_blk = (flat_q_sizes + BLOCK_M - 1) // BLOCK_M
     total_q_tiles = tiles_per_q_blk.sum().item()
     
-    # 2.2 Map TaskID -> Q_Cluster_ID
+    # Map Tasks
     task_to_q_map = torch.repeat_interleave(
-        torch.arange(B*H*QC, device=device, dtype=torch.int32), 
-        tiles_per_q_blk
+        torch.arange(B*H*QC, device=device, dtype=torch.int32), tiles_per_q_blk
     )
     
-    # 2.3 Calculate Task Q Offsets
-    # cum_tiles: [0, 2, 5, ...]
+    # Calculate Task Q Bounds
     cum_tiles = torch.zeros(B*H*QC + 1, device=device, dtype=torch.int32)
     cum_tiles[1:] = torch.cumsum(tiles_per_q_blk, dim=0)
-    
-    # Local index
     task_start_indices = cum_tiles[task_to_q_map]
-    task_ids = torch.arange(total_q_tiles, device=device, dtype=torch.int32)
-    task_local_idx = task_ids - task_start_indices
+    task_local_idx = torch.arange(total_q_tiles, device=device, dtype=torch.int32) - task_start_indices
     offset_in_cluster = task_local_idx * BLOCK_M
     
-    # Global Q Base Calculation
-    flat_q_starts = qc_offsets[..., :-1].reshape(-1) # [B*H*QC]
+    flat_q_starts = qc_offsets[..., :-1].reshape(-1)
     q_cluster_base = flat_q_starts[task_to_q_map]
-    
     t_batch = task_to_q_map // (H * QC)
     t_head = (task_to_q_map // QC) % H
     
-    # Global Q Base = (b*H + h)*S + cluster_start + offset_in_cluster
     task_q_global_base = (t_batch * H + t_head) * S + q_cluster_base + offset_in_cluster
-    
-    # Length
     current_q_sizes = flat_q_sizes[task_to_q_map]
     task_q_lens = torch.clamp(current_q_sizes - offset_in_cluster, max=BLOCK_M)
     
-    # 2.4 Map Task -> K Range (Token Indices in kv_indices)
-    # Map Q Cluster -> Block Range in write_offsets
+    # Map Task -> K Range
     q_cluster_start_block = q_blk_indptr[task_to_q_map].long()
     q_cluster_end_block = q_blk_indptr[task_to_q_map + 1].long()
-    
     task_k_token_starts = write_offsets[q_cluster_start_block]
     task_k_token_ends = write_offsets[q_cluster_end_block]
     
-    # ========================================================================
-    # PHASE 3: RUNNING (Triton Compute)
-    # ========================================================================
+    # === ALLOCATION FOR SPLIT-K ===
+    # Intermediate buffers need to store results for each task and each split
+    # Shape: [Total_Tasks, SPLIT_K, BLOCK_M, D]
+    tmp_acc = torch.empty((total_q_tiles, split_k, BLOCK_M, D), device=device, dtype=torch.float32)
+    tmp_m = torch.empty((total_q_tiles, split_k, BLOCK_M), device=device, dtype=torch.float32)
+    tmp_l = torch.empty((total_q_tiles, split_k, BLOCK_M), device=device, dtype=torch.float32)
     
     out = torch.empty_like(q)
     
-    if total_q_tiles > 0:
-        grid = (total_q_tiles,)
-        
-        _compute_attn_kernel[grid](
-            q, k, v, out,
-            kv_indices, 
-            task_k_token_starts, 
-            task_k_token_ends,
-            task_q_global_base,
-            task_q_lens,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            1.0 / math.sqrt(D),
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D
-        )
+    # === RUNNING PHASE 1: COMPUTE ===
+    # Grid: One thread block per Split per Task
+    grid_compute = (total_q_tiles * split_k, )
+    
+    _split_k_compute_kernel[grid_compute](
+        q, k, v,
+        tmp_acc, tmp_m, tmp_l,
+        kv_indices,
+        task_k_token_starts, task_k_token_ends,
+        task_q_global_base, task_q_lens,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        tmp_acc.stride(0), tmp_acc.stride(1), tmp_acc.stride(2), tmp_acc.stride(3),
+        1.0 / math.sqrt(D), split_k,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D
+    )
+    
+    # === RUNNING PHASE 2: REDUCE ===
+    # Grid: One thread block per Task (merging all splits)
+    grid_reduce = (total_q_tiles, )
+    
+    _split_k_reduce_kernel[grid_reduce](
+        out,
+        tmp_acc, tmp_m, tmp_l,
+        task_q_global_base, task_q_lens,
+        out.stride(2), out.stride(3), # Stride S, Stride D
+        tmp_acc.stride(0), tmp_acc.stride(1), tmp_acc.stride(2), tmp_acc.stride(3),
+        split_k,
+        BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D
+    )
     
     return out
 
