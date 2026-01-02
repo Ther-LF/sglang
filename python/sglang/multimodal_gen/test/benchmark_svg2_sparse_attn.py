@@ -3,13 +3,25 @@
 Benchmark script for SVG2 Sparse Attention (Real-world Video Gen Workloads).
 
 Target Models:
-1. Wan2.1-I2V/T2V-14B: 21 frames * 3600 tokens = ~75,600 tokens. (H=40, D=128)
-2. HunyuanVideo-13B: 33 frames * 3600 tokens = ~118,800 tokens. (H=48, D=128)
+1. Wan2.1-I2V/T2V-14B: (H=40, D=128)
+   - 720p: 21 frames * 3600 tokens = ~75,600 tokens
+   - 360p: 21 frames * 900 tokens = ~18,900 tokens
+2. HunyuanVideo-13B: (H=48, D=128)
+   - 720p: 33 frames * 3600 tokens = ~118,800 tokens
+   - 360p: 33 frames * 900 tokens = ~29,700 tokens
 
 Usage:
-    python benchmark_real_world.py
-    python benchmark_real_world.py --scenario wan
-    python benchmark_real_world.py --scenario hunyuan
+    python benchmark_svg2_sparse_attn.py                    # Run all 360p scenarios (default)
+    python benchmark_svg2_sparse_attn.py --scenario wan_360p
+    python benchmark_svg2_sparse_attn.py --scenario wan_720p
+    python benchmark_svg2_sparse_attn.py --scenario hunyuan_360p
+    python benchmark_svg2_sparse_attn.py --scenario hunyuan_720p
+    python benchmark_svg2_sparse_attn.py --scenario scaling
+
+Known Issues:
+    - Very large sequences (>80K tokens) may cause CUDA kernel errors in SVG2
+    - If you see "illegal memory access" errors, use 360p scenarios instead
+    - For debugging kernel errors, run with: CUDA_LAUNCH_BLOCKING=1 python ...
 """
 
 import argparse
@@ -111,6 +123,11 @@ def run_model_benchmark(
     print(f"  Configuration: Batch={B}, Heads={H}, Dim={D}, SeqLen={S}")
     print(f"  Total Tokens : {B*S:,}")
     print(f"  Memory (Est) : ~{B*S*H*D*2*3 / 1024**3:.2f} GB (KV Cache + Q)")
+    
+    # Warn for very large sequences
+    if S > 80000:
+        print(f"  ⚠️  Warning: Very large sequence (>{80000}). SVG2 may fail with kernel errors.")
+        print(f"             Consider using 360p scenario instead.")
     print("-" * 80)
 
     # 1. Prepare Data
@@ -209,6 +226,16 @@ def run_model_benchmark(
                 )
             )
             
+            # Check if SVG2 failed (returned inf)
+            if svg2_ms == float('inf'):
+                print(f"    {desc:40s} |       Failed | Kernel error (check CUDA)")
+                # Try to sync and catch any pending CUDA errors
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+                continue
+            
             # Formatting vs FlashAttn
             speedup_flash = flash_ms / svg2_ms if svg2_ms > 0 and flash_ms != float('inf') else 0
             if speedup_flash > 1: vs_flash_str = f"{speedup_flash:.2f}x faster"
@@ -223,19 +250,37 @@ def run_model_benchmark(
 
             print(f"    {desc:40s} | {svg2_ms:12.2f} | {vs_flash_str:>12s} | {vs_sdpa_str:>12s}")
 
-        except RuntimeError as e:
-            print(f"    {desc:40s} |        Error | {str(e)}")
+        except (RuntimeError, Exception) as e:
+            print(f"    {desc:40s} |        Error | {str(e)[:30]}")
+            # Try to recover from CUDA errors
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
     
-    # Cleanup after benchmark
-    torch.cuda.empty_cache()
+    # Cleanup after benchmark - with error handling
+    try:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"\n  Warning: CUDA cleanup failed: {e}")
+        print("  Attempting to reset CUDA context...")
+        # Don't crash the whole benchmark if cleanup fails
+        pass
 
 # ============================================================================
 # Main
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario", type=str, default="all", choices=["all", "wan", "hunyuan", "scaling"])
+    parser = argparse.ArgumentParser(
+        description="Benchmark SVG2 Sparse Attention for Video Generation Models"
+    )
+    parser.add_argument(
+        "--scenario", type=str, default="all", 
+        choices=["all", "wan_360p", "wan_720p", "hunyuan_360p", "hunyuan_720p", "scaling"],
+        help="Benchmark scenario (default: all = 360p scenarios only)"
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -245,9 +290,23 @@ def main():
     print("Initializing SVG2 Components...")
     comps = import_svg2_components()
     
-    # --- 1. Wan2.1 Scenario ---
-    if args.scenario in ["all", "wan"]:
-        # Wan2.1-14B: 21 frames * 3600 tokens
+    if args.scenario == "all":
+        print("\nNote: 'all' scenario runs 360p versions to avoid OOM.")
+        print("      Use wan_720p/hunyuan_720p for full resolution tests.\n")
+    
+    # --- 1. Wan2.1 360p Scenario ---
+    if args.scenario in ["all", "wan_360p"]:
+        # Wan2.1-14B 360p: 21 frames * 900 tokens = 18,900 tokens
+        # H=40, D=128
+        run_model_benchmark(
+            "Wan2.1-I2V-14B (360p)",
+            B=1, H=40, D=128, S=18900,
+            svg2_components=comps
+        )
+    
+    # --- 2. Wan2.1 720p Scenario ---
+    if args.scenario in ["wan_720p"]:
+        # Wan2.1-14B 720p: 21 frames * 3600 tokens = 75,600 tokens
         # H=40, D=128
         run_model_benchmark(
             "Wan2.1-I2V-14B (720p)",
@@ -255,9 +314,19 @@ def main():
             svg2_components=comps
         )
 
-    # --- 2. HunyuanVideo Scenario ---
-    if args.scenario in ["all", "hunyuan"]:
-        # HunyuanVideo-13B: 33 frames * 3600 tokens
+    # --- 3. HunyuanVideo 360p Scenario ---
+    if args.scenario in ["all", "hunyuan_360p"]:
+        # HunyuanVideo-13B 360p: 33 frames * 900 tokens = 29,700 tokens
+        # H=48, D=128
+        run_model_benchmark(
+            "HunyuanVideo-T2V-13B (360p)",
+            B=1, H=48, D=128, S=29700,
+            svg2_components=comps
+        )
+    
+    # --- 4. HunyuanVideo 720p Scenario ---
+    if args.scenario in ["hunyuan_720p"]:
+        # HunyuanVideo-13B 720p: 33 frames * 3600 tokens = 118,800 tokens
         # H=48, D=128
         run_model_benchmark(
             "HunyuanVideo-T2V-13B (720p)",
@@ -265,8 +334,8 @@ def main():
             svg2_components=comps
         )
 
-    # --- 3. Scaling Curve (Standard) ---
-    if args.scenario in ["all", "scaling"]:
+    # --- 5. Scaling Curve (Standard) ---
+    if args.scenario in ["scaling"]:
         print_header("Standard Scaling Curve (H=24, D=128)")
         lengths = [16384, 32768, 65536, 96000]
         for S in lengths:
