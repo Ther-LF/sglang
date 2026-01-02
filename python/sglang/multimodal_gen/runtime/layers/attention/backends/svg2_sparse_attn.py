@@ -550,7 +550,8 @@ def _split_k_compute_kernel(
     stride_m_t, stride_m_s, # Strides for Tmp_M/L
     
     # Config
-    sm_scale, SPLIT_K,
+    sm_scale,
+    SPLIT_K: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr
 ):
     # Grid: (Num_Tasks * SPLIT_K)
@@ -767,7 +768,8 @@ def block_sparse_attention(
     # === PLANNING PHASE ===
     
     # 1. CSR Indices Generation (Same as before)
-    flat_mask = block_mask.view(-1, KC)
+    # Use reshape instead of view to handle non-contiguous inputs
+    flat_mask = block_mask.reshape(-1, KC)
     sparse_mask = flat_mask.float().to_sparse_csr()
     q_blk_indptr = sparse_mask.crow_indices().int()
     k_blk_indices = sparse_mask.col_indices().int()
@@ -808,7 +810,8 @@ def block_sparse_attention(
         )
     
     # 2. Scheduling (Q-Tiling + Task Mapping)
-    flat_q_sizes = q_cluster_sizes.view(-1)
+    # Use reshape instead of view
+    flat_q_sizes = q_cluster_sizes.reshape(-1)
     tiles_per_q_blk = (flat_q_sizes + BLOCK_M - 1) // BLOCK_M
     total_q_tiles = tiles_per_q_blk.sum().item()
     
@@ -862,7 +865,9 @@ def block_sparse_attention(
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         tmp_acc.stride(0), tmp_acc.stride(1), tmp_acc.stride(2), tmp_acc.stride(3),
-        1.0 / math.sqrt(D), split_k,
+        tmp_m.stride(0), tmp_m.stride(1),
+        1.0 / math.sqrt(D),
+        SPLIT_K=split_k,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D
     )
     
@@ -876,7 +881,8 @@ def block_sparse_attention(
         task_q_global_base, task_q_lens,
         out.stride(2), out.stride(3), # Stride S, Stride D
         tmp_acc.stride(0), tmp_acc.stride(1), tmp_acc.stride(2), tmp_acc.stride(3),
-        split_k,
+        tmp_m.stride(0), tmp_m.stride(1),
+        SPLIT_K=split_k,
         BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D
     )
     
