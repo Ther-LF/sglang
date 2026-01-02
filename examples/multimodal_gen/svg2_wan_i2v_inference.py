@@ -271,7 +271,6 @@ def main():
         # Determine output filename for this run
         current_filename = args.output_filename
         if suffix:
-            import os
             name, ext = os.path.splitext(current_filename)
             current_filename = f"{name}{suffix}{ext}"
         
