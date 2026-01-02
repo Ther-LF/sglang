@@ -330,20 +330,23 @@ def benchmark_full_attention(
     fixed_clusters: Optional[int] = None,
     max_k_per_q: Optional[int] = None,
     kmeans_iters: int = 2,
+    batch_size: int = 1,
+    num_heads: int = 16,
+    head_dim: int = 128,
 ):
     """Benchmark full SVG2 attention vs Torch attention."""
     print_header("Full Attention Benchmark: SVG2 vs Torch")
     
     if seq_lengths is None:
-        seq_lengths = [1024, 2048, 4096, 8192, 16384]
+        seq_lengths = [1024, 2048, 4096, 8192, 16384, 32768]
     
     if top_p_values is None:
         top_p_values = [0.3, 0.5, 0.7, 0.9]
     
-    B, H, D = 1, 16, 64
+    B, H, D = batch_size, num_heads, head_dim
     num_clusters = 64
     
-    print(f"\n  Config: B={B}, H={H}, D={D}, num_clusters={num_clusters}")
+    print(f"\n  Config: B={B}, H={H}, D={D}")
     print("-" * 70)
     
     for S in seq_lengths:
@@ -562,6 +565,9 @@ def main():
     parser.add_argument("--component", type=str, default="all",
                         choices=["all", "kmeans", "permutation", "block_attn", "full", "memory", "scalability"],
                         help="Which component to benchmark")
+    parser.add_argument("--batch-size", type=int, default=1, help="Batch size (B)")
+    parser.add_argument("--num-heads", type=int, default=16, help="Number of heads (H)")
+    parser.add_argument("--head-dim", type=int, default=128, help="Head dimension (D)")
     args = parser.parse_args()
     
     if not torch.cuda.is_available():
@@ -587,15 +593,35 @@ def main():
         benchmark_block_sparse_attention(components, args.device)
     
     if args.component == "all" or args.component == "full":
-        benchmark_full_attention(
-            components, 
-            args.device,
-            seq_lengths=args.seq_lengths,
-            top_p_values=args.top_p,
-            fixed_clusters=args.fixed_clusters,
-            max_k_per_q=args.max_k_per_q,
-            kmeans_iters=args.full_kmeans_iters,
-        )
+        # Define model configurations (B, H, D)
+        model_configs = [
+            (args.batch_size, args.num_heads, args.head_dim), # User custom
+        ]
+        
+        # If user didn't specify custom flags (using defaults), add more standard configs
+        if args.batch_size == 1 and args.num_heads == 16 and args.head_dim == 128:
+            model_configs = [
+                (1, 16, 64),   # Small/Base
+                (1, 16, 128),  # Standard Video
+                (1, 24, 128),  # Large
+                (1, 32, 128),  # Larger (e.g. Wan-14B approx)
+                (1, 64, 128),  # Larger (e.g. Wan-14B approx)
+                (2, 16, 128),  # Batched
+            ]
+
+        for b, h, d in model_configs:
+            benchmark_full_attention(
+                components, 
+                args.device,
+                seq_lengths=args.seq_lengths,
+                top_p_values=args.top_p,
+                fixed_clusters=args.fixed_clusters,
+                max_k_per_q=args.max_k_per_q,
+                kmeans_iters=args.full_kmeans_iters,
+                batch_size=b,
+                num_heads=h,
+                head_dim=d,
+            )
     
     if args.component == "all" or args.component == "memory":
         benchmark_memory(components, args.device)

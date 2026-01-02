@@ -787,7 +787,7 @@ def block_sparse_attention(
     batch_ids = q_global_ids // (H * QC)
     head_ids = (q_global_ids // QC) % H
     
-    flat_kc_offsets = kc_offsets.view(B*H, KC+1)
+    flat_kc_offsets = kc_offsets.reshape(B*H, KC+1)
     bh_ids = batch_ids * H + head_ids
     
     active_k_starts = flat_kc_offsets[bh_ids, k_blk_indices]
