@@ -779,7 +779,9 @@ def svg2_attention_forward(
     top_p: float = 0.5,
     kmeans_iters: int = 5,
     max_k_clusters_per_q: Optional[int] = None,
-) -> torch.Tensor:
+    init_q_centroids: Optional[torch.Tensor] = None,
+    init_k_centroids: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Complete SVG2 (Semantic-Aware Permutation) attention forward pass.
     
@@ -790,9 +792,13 @@ def svg2_attention_forward(
         top_p: Top-p fraction for block mask
         kmeans_iters: K-Means iterations
         max_k_clusters_per_q: Optional cap of kept key clusters per query cluster
+        init_q_centroids: Initial centroids for Query K-Means
+        init_k_centroids: Initial centroids for Key K-Means
     
     Returns:
         output: Attention output [B, S, H, D]
+        final_q_centroids: Updated Query centroids [B, H, Kq, D]
+        final_k_centroids: Updated Key centroids [B, H, Kk, D]
     """
     B, S, H, D = q.shape
     device = q.device
@@ -807,12 +813,24 @@ def svg2_attention_forward(
     q_flat = q.reshape(B * H, S, D)
     k_flat = k.reshape(B * H, S, D)
     
+    # Handle initial centroids if provided
+    # They come in as [B, H, K, D], need to reshape to [B*H, K, D] (which triton_kmeans expects for batched init)
+    # triton_kmeans expects [B_kmeans, K, D] where B_kmeans = B*H here
+    
+    q_init = None
+    if init_q_centroids is not None:
+        q_init = init_q_centroids.reshape(B * H, num_q_clusters, D)
+        
+    k_init = None
+    if init_k_centroids is not None:
+        k_init = init_k_centroids.reshape(B * H, num_k_clusters, D)
+    
     # Step 1: K-Means clustering
     q_labels, q_centroids, q_cluster_sizes = triton_kmeans(
-        q_flat, num_q_clusters, max_iters=kmeans_iters
+        q_flat, num_q_clusters, max_iters=kmeans_iters, init_centroids=q_init
     )
     k_labels, k_centroids, k_cluster_sizes = triton_kmeans(
-        k_flat, num_k_clusters, max_iters=kmeans_iters
+        k_flat, num_k_clusters, max_iters=kmeans_iters, init_centroids=k_init
     )
     
     # Reshape back
@@ -850,7 +868,7 @@ def svg2_attention_forward(
     # Transpose back to [B, S, H, D]
     output = output.transpose(1, 2).contiguous()
     
-    return output
+    return output, q_centroids, k_centroids
 
 
 # ============================================================================
@@ -1063,14 +1081,46 @@ class SVG2SparseAttentionImpl(AttentionImpl):
             return self._full_attention(query, key, value)
         
         # Use SVG2 sparse attention
-        output = svg2_attention_forward(
+        
+        # Determine if we can reuse centroids from previous steps
+        # If centroids are initialized and we are in a later timestep (or logic permits), reuse them
+        # Note: In reverse diffusion, timesteps decrease. 
+        # But we simply check if we have cached centroids.
+        
+        # Default strategy: 
+        # - If no cache: init mode (more iters)
+        # - If cache: step mode (fewer iters, reuse centroids)
+        
+        current_kmeans_iters = kmeans_iters
+        init_q = None
+        init_k = None
+        
+        if self.centroids_initialized and self.q_centroids is not None:
+            # Check shape compatibility (batch size might change or be consistent)
+            # q_centroids shape: [B, H, K, D]
+            if self.q_centroids.shape[0] == query.shape[0] and \
+               self.q_centroids.shape[1] == query.shape[2]: # num_heads
+                init_q = self.q_centroids
+                init_k = self.k_centroids
+                # Use fewer iterations for update step (e.g., 1 or 2)
+                # Original SVG uses 1 or similar small number for steps
+                current_kmeans_iters = 1
+        
+        output, new_q_centroids, new_k_centroids = svg2_attention_forward(
             query, key, value,
             num_q_clusters=num_q_clusters,
             num_k_clusters=num_k_clusters,
             top_p=top_p,
-            kmeans_iters=kmeans_iters,
+            kmeans_iters=current_kmeans_iters,
             max_k_clusters_per_q=max_k_clusters_per_q,
+            init_q_centroids=init_q,
+            init_k_centroids=init_k,
         )
+        
+        # Update cache
+        self.q_centroids = new_q_centroids
+        self.k_centroids = new_k_centroids
+        self.centroids_initialized = True
         
         return output
     
