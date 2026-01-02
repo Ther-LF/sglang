@@ -212,6 +212,16 @@ class ServerArgs:
     # VSA parameters
     VSA_sparsity: float = 0.0  # inference/validation sparsity
 
+    # SVG2 parameters
+    num_q_clusters: int = 64
+    num_k_clusters: int = 64
+    top_p_kmeans: float = 0.5
+    min_kc_ratio: float = 0.0
+    kmeans_iter_init: int = 5
+    kmeans_iter_step: int = 1
+    first_times_fp: float = 0.0
+    first_layers_fp: float = 0.0
+
     # V-MoBA parameters
     moba_config_path: str | None = None
     moba_config: dict[str, Any] = field(default_factory=dict)
@@ -506,6 +516,56 @@ class ServerArgs:
             type=float,
             default=ServerArgs.VSA_sparsity,
             help="Validation sparsity for VSA",
+        )
+
+        # SVG2 parameters
+        parser.add_argument(
+            "--num-q-clusters",
+            type=int,
+            default=ServerArgs.num_q_clusters,
+            help="Number of query clusters for SVG2",
+        )
+        parser.add_argument(
+            "--num-k-clusters",
+            type=int,
+            default=ServerArgs.num_k_clusters,
+            help="Number of key clusters for SVG2",
+        )
+        parser.add_argument(
+            "--top-p-kmeans",
+            type=float,
+            default=ServerArgs.top_p_kmeans,
+            help="Top-p for block mask selection in SVG2",
+        )
+        parser.add_argument(
+            "--min-kc-ratio",
+            type=float,
+            default=ServerArgs.min_kc_ratio,
+            help="Minimum ratio of key clusters to keep in SVG2",
+        )
+        parser.add_argument(
+            "--kmeans-iter-init",
+            type=int,
+            default=ServerArgs.kmeans_iter_init,
+            help="K-Means iterations for initialization in SVG2",
+        )
+        parser.add_argument(
+            "--kmeans-iter-step",
+            type=int,
+            default=ServerArgs.kmeans_iter_step,
+            help="K-Means iterations per step in SVG2",
+        )
+        parser.add_argument(
+            "--first-times-fp",
+            type=float,
+            default=ServerArgs.first_times_fp,
+            help="Fraction of initial timesteps using full attention in SVG2",
+        )
+        parser.add_argument(
+            "--first-layers-fp",
+            type=float,
+            default=ServerArgs.first_layers_fp,
+            help="Fraction of initial layers using full attention in SVG2",
         )
 
         # Master port for distributed inference
