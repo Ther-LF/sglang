@@ -502,143 +502,157 @@ def identify_dynamic_mask(
 # ============================================================================
 
 
+# ============================================================================
+# Part 4: FlashInfer-style Indirect Access Attention Kernels
+# ============================================================================
+
+
 @triton.jit
-def _sparse_attn_csr_kernel(
+def _kv_index_expansion_kernel(
+    # Input: Active K Blocks info
+    k_base_id_ptr,    # [Num_Active_Blocks] 每个活跃块在 K tensor 中的起始 Token ID (Global)
+    k_lengths_ptr,    # [Num_Active_Blocks] 每个活跃块的长度
+    
+    # Input: Write offsets
+    write_offset_ptr, # [Num_Active_Blocks] 这个块应该写在 output list 的第几个位置
+    
+    # Output: Flattened Indices
+    out_indices_ptr,  # [Total_Active_K_Tokens] 最终的索引清单
+    
+    MAX_BLOCK_SIZE: tl.constexpr
+):
+    """
+    Planning Phase Kernel:
+    Expands (Base, Length) tuples into a flat list of token indices: [Base, Base+1, ... Base+Len-1].
+    """
+    pid = tl.program_id(0)
+    
+    # 1. Read Block Metadata
+    base_id = tl.load(k_base_id_ptr + pid)
+    length = tl.load(k_lengths_ptr + pid)
+    write_start = tl.load(write_offset_ptr + pid)
+    
+    # 2. Generate offsets [0, 1, 2, ... MAX]
+    offs = tl.arange(0, MAX_BLOCK_SIZE)
+    mask = offs < length
+    
+    # 3. Compute Physical Indices
+    vals = base_id + offs
+    
+    # 4. Write to flattened list
+    tl.store(out_indices_ptr + write_start + offs, vals, mask=mask)
+
+
+@triton.jit
+def _compute_attn_kernel(
     Q, K, V, Out,
-    # CSR Indices
-    kv_indices_ptr, # [NNZ] int32
-    q_indptr_ptr,   # [B*H*QC + 1] int32
-    # Cumulative Sizes
-    qc_cum_size, kc_cum_size,
-    # Strides
+    
+    # === Indirection Buffers (The "List") ===
+    kv_indices_ptr,   # [Total_K_Tokens] All active K Token physical indices
+    
+    # === Task Metadata (Load Balancing) ===
+    task_k_start_ptr, # [Num_Tasks] Start index in kv_indices for this task
+    task_k_end_ptr,   # [Num_Tasks] End index in kv_indices for this task
+    
+    task_q_base_ptr,  # [Num_Tasks] Q Physical Token Base ID for this task
+    task_q_len_ptr,   # [Num_Tasks] Length of Q chunk for this task
+    
+    # === Strides ===
     stride_qb, stride_qh, stride_qs, stride_qd,
     stride_kb, stride_kh, stride_ks, stride_kd,
     stride_vb, stride_vh, stride_vs, stride_vd,
     stride_ob, stride_oh, stride_os, stride_od,
-    stride_qcs_b, stride_qcs_h, stride_qcs_qc,
-    stride_kcs_b, stride_kcs_h, stride_kcs_kc,
-    # Meta
-    H, QC_NUM, 
+    
+    # === Constants ===
     sm_scale,
-    # Block Constants
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr
+    BLOCK_M: tl.constexpr, 
+    BLOCK_N: tl.constexpr, 
+    BLOCK_D: tl.constexpr,
 ):
-    # pid 对应一个具体的 Q 簇 (展平后的视图: batch * head * q_cluster)
+    """
+    Running Phase Kernel:
+    Computes attention using Indirect Access (Gather K/V from list) and Load Balancing (Tiled Q).
+    """
+    # 1. Get Task ID
     pid = tl.program_id(0)
     
-    # 反解坐标
-    q_block_idx = pid % QC_NUM
-    pid_bh = pid // QC_NUM
-    h = pid_bh % H
-    b = pid_bh // H
+    # 2. Get Q Info
+    q_phys_base = tl.load(task_q_base_ptr + pid)
+    q_len = tl.load(task_q_len_ptr + pid)
     
-    # --- 1. 获取任务范围 (CSR Planning 的结果) ---
-    # q_indptr 告诉我们：在这个 CSR 数组里，属于我这个 pid 的 K 块是从哪到哪
-    csr_start = tl.load(q_indptr_ptr + pid)
-    csr_end = tl.load(q_indptr_ptr + pid + 1)
+    # 3. Get K List Range
+    k_list_start = tl.load(task_k_start_ptr + pid)
+    k_list_end = tl.load(task_k_end_ptr + pid)
     
-    # 如果没有 K 块要处理，直接返回 (Zero-overhead for empty rows)
-    if csr_end == csr_start:
+    if k_list_end == k_list_start:
         return
 
-    # --- 2. Q Block 定位 ---
-    qcs_offset = b * stride_qcs_b + h * stride_qcs_h
-    q_start = tl.load(qc_cum_size + qcs_offset + q_block_idx * stride_qcs_qc)
-    q_end = tl.load(qc_cum_size + qcs_offset + (q_block_idx + 1) * stride_qcs_qc)
-    q_len = q_end - q_start
-    
-    if q_len == 0: return
-
-    # 指针初始化
-    q_base = Q + b * stride_qb + h * stride_qh + q_start * stride_qs
-    k_base = K + b * stride_kb + h * stride_kh
-    v_base = V + b * stride_vb + h * stride_vh
-    out_base = Out + b * stride_ob + h * stride_oh + q_start * stride_os
-    
-    kcs_base_ptr = kc_cum_size + b * stride_kcs_b + h * stride_kcs_h
-
-    # --- 3. Q 切分循环 ---
+    # 4. Load Q Tile
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_D)
     
-    for q_chunk_start in range(0, q_len, BLOCK_M):
-        q_rows = q_chunk_start + offs_m
-        q_mask = q_rows < q_len
+    # Q ptr = Q_Base + (Global_Q_Token_ID * stride_qs) + (Offs_D * stride_qd)
+    # Note: stride_qd is usually 1
+    q_ptr = Q + q_phys_base * stride_qs + offs_m[:, None] * stride_qs + offs_d[None, :] * stride_qd
+    q_mask = (offs_m[:, None] < q_len) & (offs_d[None, :] < BLOCK_D)
+    q_tile = tl.load(q_ptr, mask=q_mask, other=0.0)
+    
+    # 5. Initialize Accumulators
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+    
+    # 6. Core Loop: Linear Scan over Indirection List
+    for start_idx in range(k_list_start, k_list_end, BLOCK_N):
+        # Current chunk length
+        actual_block_n = min(BLOCK_N, k_list_end - start_idx)
         
-        # 加载 Q Chunk
-        q_ptr = q_base + q_rows[:, None] * stride_qs + offs_d[None, :]
-        q_chunk = tl.load(q_ptr, mask=q_mask[:, None] & (offs_d[None, :] < BLOCK_D), other=0.0)
+        offs_n = tl.arange(0, BLOCK_N)
+        chunk_mask = offs_n < actual_block_n
         
-        # Online Softmax 累加器
-        m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-        acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+        # === Indirect Access ===
+        # 1. Load K Physical IDs from List
+        current_indices_ptr = kv_indices_ptr + start_idx + offs_n
+        k_phys_ids = tl.load(current_indices_ptr, mask=chunk_mask, other=0)
         
-        # --- 4. K 块遍历 (基于 CSR 索引) ---
-        # 这里的循环次数 = 活跃 K 块的数量，没有浪费！
-        for csr_idx in range(csr_start, csr_end):
-            # 获取真实的 K Block ID
-            k_block_idx = tl.load(kv_indices_ptr + csr_idx)
-            
-            # 获取 K Block 长度信息
-            k_start = tl.load(kcs_base_ptr + k_block_idx * stride_kcs_kc)
-            k_end = tl.load(kcs_base_ptr + (k_block_idx + 1) * stride_kcs_kc)
-            k_len = k_end - k_start
-            
-            if k_len > 0:
-                k_chunk_ptr = k_base + k_start * stride_ks
-                v_chunk_ptr = v_base + k_start * stride_vs
-                
-                # --- 5. K 切分循环 (FlashAttention Core) ---
-                offs_n = tl.arange(0, BLOCK_N)
-                for k_chunk_start in range(0, k_len, BLOCK_N):
-                    k_rows = k_chunk_start + offs_n
-                    k_mask = k_rows < k_len
-                    
-                    k_ptr = k_chunk_ptr + k_rows[:, None] * stride_ks + offs_d[None, :]
-                    v_ptr = v_chunk_ptr + k_rows[:, None] * stride_vs + offs_d[None, :]
-                    
-                    # Ensure we don't read out of bounds for D dim
-                    load_mask = k_mask[:, None] & (offs_d[None, :] < BLOCK_D)
-                    k_chunk = tl.load(k_ptr, mask=load_mask, other=0.0)
-                    v_chunk = tl.load(v_ptr, mask=load_mask, other=0.0)
-                    
-                    # QK^T
-                    qk = tl.dot(q_chunk, tl.trans(k_chunk))
-                    qk *= sm_scale
-                    
-                    # Masking (inf) - critical for padded K rows
-                    qk = tl.where(q_mask[:, None] & k_mask[None, :], qk, float("-inf"))
-                    
-                    # Online Softmax
-                    m_curr = tl.max(qk, 1)
-                    m_new = tl.maximum(m_i, m_curr)
-                    
-                    # p = exp(qk - m_new)
-                    p = tl.exp(qk - m_new[:, None])
-                    
-                    # alpha = exp(m_prev - m_new)
-                    alpha = tl.exp(m_i - m_new)
-                    
-                    # Update l_i
-                    l_i = l_i * alpha + tl.sum(p, 1)
-                    m_i = m_new
-                    
-                    # Update accumulator
-                    # Check dtype for p @ v
-                    p = p.to(v_chunk.dtype)
-                    acc = acc * alpha[:, None] + tl.dot(p, v_chunk)
-
-        # --- 6. 写回 Output ---
-        # Normalize: out = acc / l_i
-        # Avoid div by zero
-        l_i_safe = tl.where(l_i == 0, 1.0, l_i)
-        acc = acc / l_i_safe[:, None]
-        # If l_i was 0, result should be 0
-        acc = tl.where(l_i[:, None] == 0, 0.0, acc)
+        # 2. Compute K/V Pointers (Gather)
+        # K ptr = K_Base + (Global_K_Token_ID * stride_ks) + (Offs_D * stride_kd)
+        k_ptrs = K + k_phys_ids[:, None] * stride_ks + offs_d[None, :] * stride_kd
+        v_ptrs = V + k_phys_ids[:, None] * stride_vs + offs_d[None, :] * stride_vd
         
-        out_ptr = out_base + q_rows[:, None] * stride_os + offs_d[None, :]
-        tl.store(out_ptr, acc.to(Out.dtype.element_ty), mask=q_mask[:, None] & (offs_d[None, :] < BLOCK_D))
+        load_mask = chunk_mask[:, None] & (offs_d[None, :] < BLOCK_D)
+        k_tile = tl.load(k_ptrs, mask=load_mask, other=0.0)
+        v_tile = tl.load(v_ptrs, mask=load_mask, other=0.0)
+        
+        # === Attention Computation ===
+        # QK^T
+        qk = tl.dot(q_tile, tl.trans(k_tile))
+        qk *= sm_scale
+        
+        # Masking
+        qk = tl.where(chunk_mask[None, :], qk, float("-inf"))
+        
+        # Online Softmax
+        m_curr = tl.max(qk, 1)
+        m_new = tl.maximum(m_i, m_curr)
+        p = tl.exp(qk - m_new[:, None])
+        alpha = tl.exp(m_i - m_new)
+        
+        l_i = l_i * alpha + tl.sum(p, 1)
+        m_i = m_new
+        
+        # Accumulate
+        p = p.to(v_tile.dtype)
+        acc = acc * alpha[:, None] + tl.dot(p, v_tile)
+        
+    # 7. Finalize and Store
+    l_i_safe = tl.where(l_i == 0, 1.0, l_i)
+    acc = acc / l_i_safe[:, None]
+    acc = tl.where(l_i[:, None] == 0, 0.0, acc)
+    
+    out_ptr = Out + q_phys_base * stride_os + offs_m[:, None] * stride_os + offs_d[None, :] * stride_od
+    out_mask = (offs_m[:, None] < q_len) & (offs_d[None, :] < BLOCK_D)
+    tl.store(out_ptr, acc.to(Out.dtype.element_ty), mask=out_mask)
 
 
 def block_sparse_attention(
@@ -650,80 +664,163 @@ def block_sparse_attention(
     k_cluster_sizes: torch.Tensor,  # [B, H, Kk]
 ) -> torch.Tensor:
     """
-    Block sparse attention with variable block sizes using Triton CSR kernel.
+    FlashInfer-style implementation of Block Sparse Attention.
+    
+    Phase 1: Planning (Index Expansion on GPU)
+    Phase 2: Scheduling (Load Balancing)
+    Phase 3: Running (Compute)
     """
     B, H, S, D = q.shape
-    qc_num = q_cluster_sizes.shape[-1]
-    kc_num = k_cluster_sizes.shape[-1]
-    dtype = q.dtype
+    QC = q_cluster_sizes.shape[-1]
+    KC = k_cluster_sizes.shape[-1]
+    device = q.device
     
-    # Assertions and checks
-    assert q.is_cuda and k.is_cuda and v.is_cuda, "Inputs must be CUDA tensors"
-    assert block_mask.is_cuda and q_cluster_sizes.is_cuda and k_cluster_sizes.is_cuda
-    
-    # Calculate scale factor (using float32 for stability)
-    scale = 1.0 / math.sqrt(D)
-    
-    # Precompute cumulative sizes (keep on device)
-    # Add a 0 at the start for offsets
-    qc_cum_size = torch.zeros((B, H, qc_num + 1), device=q.device, dtype=torch.int32)
-    qc_cum_size[..., 1:] = torch.cumsum(q_cluster_sizes, dim=-1)
-    
-    kc_cum_size = torch.zeros((B, H, kc_num + 1), device=q.device, dtype=torch.int32)
-    kc_cum_size[..., 1:] = torch.cumsum(k_cluster_sizes, dim=-1)
-    
-    # --- CSR Planning ---
-    # Convert dense mask [B, H, Qc, Kc] to CSR format
-    # Flatten to [Rows, Cols] where Rows = B*H*Qc
-    flat_mask = block_mask.view(-1, kc_num)
-    
-    # Convert to Sparse CSR Tensor
-    # Note: Input to to_sparse_csr must be float/int/complex, bool not always supported directly
-    sparse_mask = flat_mask.float().to_sparse_csr()
-    
-    # Extract CSR components
-    q_indptr = sparse_mask.crow_indices().int()
-    kv_indices = sparse_mask.col_indices().int()
-    
-    # Output tensor
-    out = torch.empty_like(q)
-    
-    # Triton kernel config
+    # Kernel Config
+    BLOCK_M = 64 # Q Tile Size (Load Balancing Unit)
+    BLOCK_N = 64 # K Chunk Size
     BLOCK_D = triton.next_power_of_2(D)
     
-    if S <= 512:
-        BLOCK_M = 32
-        BLOCK_N = 32
-    elif S <= 1024:
-        BLOCK_M = 64
-        BLOCK_N = 64
-    else:
-        BLOCK_M = 64 # Tuned down from 128 for safety
-        BLOCK_N = 64
-        
-    BLOCK_M = min(BLOCK_M, S)
-    BLOCK_N = min(BLOCK_N, S)
+    # ========================================================================
+    # PHASE 1: PLANNING (Metadata Generation)
+    # ========================================================================
     
-    # Launch grid: One program per query block per batch/head
-    # Note: Using flattened QC_NUM dimension
-    grid = (B * H * qc_num,)
+    # 1.1 Calculate Cumulative Sizes (Offset Map)
+    # [B, H, QC+1]
+    qc_offsets = torch.zeros((B, H, QC + 1), device=device, dtype=torch.int32)
+    qc_offsets[..., 1:] = torch.cumsum(q_cluster_sizes, dim=-1)
     
-    _sparse_attn_csr_kernel[grid](
-        q, k, v, out,
-        kv_indices, q_indptr,
-        qc_cum_size, kc_cum_size,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        qc_cum_size.stride(0), qc_cum_size.stride(1), qc_cum_size.stride(2),
-        kc_cum_size.stride(0), kc_cum_size.stride(1), kc_cum_size.stride(2),
-        H, qc_num,
-        scale,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_D=BLOCK_D,
+    kc_offsets = torch.zeros((B, H, KC + 1), device=device, dtype=torch.int32)
+    kc_offsets[..., 1:] = torch.cumsum(k_cluster_sizes, dim=-1)
+    
+    # 1.2 Identify Active Pairs (The "Order")
+    # [B*H*QC, KC]
+    flat_mask = block_mask.view(-1, KC)
+    # Use PyTorch CSR for fast indptr generation
+    sparse_mask = flat_mask.float().to_sparse_csr()
+    
+    # crow_indices: [B*H*QC + 1]
+    q_blk_indptr = sparse_mask.crow_indices().int() 
+    # col_indices: [NNZ]
+    k_blk_indices = sparse_mask.col_indices().int()
+    
+    NNZ = k_blk_indices.numel()
+    
+    # 1.3 Expand K Indices (The "KV Index Kernel")
+    # Recover (b, h) for each active entry in kv_indices
+    active_counts = q_blk_indptr[1:] - q_blk_indptr[:-1]
+    
+    # [NNZ] -> Global Q Cluster ID (0...B*H*QC-1)
+    q_global_ids = torch.repeat_interleave(torch.arange(B*H*QC, device=device, dtype=torch.int32), active_counts)
+    
+    batch_ids = q_global_ids // (H * QC)
+    head_ids = (q_global_ids // QC) % H
+    
+    # Flatten kc_offsets to [B*H, KC+1] to use advanced indexing
+    flat_kc_offsets = kc_offsets.view(B*H, KC+1)
+    bh_ids = batch_ids * H + head_ids
+    
+    active_k_starts = flat_kc_offsets[bh_ids, k_blk_indices] # [NNZ] (relative to S)
+    active_k_ends = flat_kc_offsets[bh_ids, k_blk_indices + 1] # [NNZ]
+    active_k_lengths = active_k_ends - active_k_starts # [NNZ]
+    
+    # Calculate Global Base Address for K (Token Level)
+    # Global_Offset = (b*H + h)*S + start
+    global_k_offsets = bh_ids * S + active_k_starts
+    
+    # Allocate the "List"
+    total_active_k_tokens = active_k_lengths.sum().item()
+    kv_indices = torch.empty(total_active_k_tokens, device=device, dtype=torch.int64)
+    
+    # Calculate write offsets for the list
+    write_offsets = torch.zeros(NNZ + 1, device=device, dtype=torch.int32)
+    write_offsets[1:] = torch.cumsum(active_k_lengths, dim=0)
+    
+    # Launch Triton Index Expansion
+    if NNZ > 0:
+        max_len = int(active_k_lengths.max().item())
+        # Safe guard for max_len=0
+        if max_len > 0:
+            grid_plan = (NNZ,)
+            _kv_index_expansion_kernel[grid_plan](
+                global_k_offsets,   # Base IDs
+                active_k_lengths,   # Lengths
+                write_offsets,      # Where to write
+                kv_indices,         # Output buffer
+                triton.next_power_of_2(max_len)
+            )
+    
+    # ========================================================================
+    # PHASE 2: SCHEDULING (Load Balancing / Tiling)
+    # ========================================================================
+    
+    # 2.1 Calculate tiles per Q Cluster
+    # q_cluster_sizes: [B, H, QC] -> [B*H*QC]
+    flat_q_sizes = q_cluster_sizes.view(-1)
+    tiles_per_q_blk = (flat_q_sizes + BLOCK_M - 1) // BLOCK_M
+    total_q_tiles = tiles_per_q_blk.sum().item()
+    
+    # 2.2 Map TaskID -> Q_Cluster_ID
+    task_to_q_map = torch.repeat_interleave(
+        torch.arange(B*H*QC, device=device, dtype=torch.int32), 
+        tiles_per_q_blk
     )
+    
+    # 2.3 Calculate Task Q Offsets
+    # cum_tiles: [0, 2, 5, ...]
+    cum_tiles = torch.zeros(B*H*QC + 1, device=device, dtype=torch.int32)
+    cum_tiles[1:] = torch.cumsum(tiles_per_q_blk, dim=0)
+    
+    # Local index
+    task_start_indices = cum_tiles[task_to_q_map]
+    task_ids = torch.arange(total_q_tiles, device=device, dtype=torch.int32)
+    task_local_idx = task_ids - task_start_indices
+    offset_in_cluster = task_local_idx * BLOCK_M
+    
+    # Global Q Base Calculation
+    flat_q_starts = qc_offsets[..., :-1].reshape(-1) # [B*H*QC]
+    q_cluster_base = flat_q_starts[task_to_q_map]
+    
+    t_batch = task_to_q_map // (H * QC)
+    t_head = (task_to_q_map // QC) % H
+    
+    # Global Q Base = (b*H + h)*S + cluster_start + offset_in_cluster
+    task_q_global_base = (t_batch * H + t_head) * S + q_cluster_base + offset_in_cluster
+    
+    # Length
+    current_q_sizes = flat_q_sizes[task_to_q_map]
+    task_q_lens = torch.clamp(current_q_sizes - offset_in_cluster, max=BLOCK_M)
+    
+    # 2.4 Map Task -> K Range (Token Indices in kv_indices)
+    # Map Q Cluster -> Block Range in write_offsets
+    q_cluster_start_block = q_blk_indptr[task_to_q_map].long()
+    q_cluster_end_block = q_blk_indptr[task_to_q_map + 1].long()
+    
+    task_k_token_starts = write_offsets[q_cluster_start_block]
+    task_k_token_ends = write_offsets[q_cluster_end_block]
+    
+    # ========================================================================
+    # PHASE 3: RUNNING (Triton Compute)
+    # ========================================================================
+    
+    out = torch.empty_like(q)
+    
+    if total_q_tiles > 0:
+        grid = (total_q_tiles,)
+        
+        _compute_attn_kernel[grid](
+            q, k, v, out,
+            kv_indices, 
+            task_k_token_starts, 
+            task_k_token_ends,
+            task_q_global_base,
+            task_q_lens,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            1.0 / math.sqrt(D),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D
+        )
     
     return out
 
