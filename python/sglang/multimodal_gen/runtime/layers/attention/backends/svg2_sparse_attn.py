@@ -784,7 +784,7 @@ def svg2_attention_forward(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Complete SVG2 (Semantic-Aware Permutation) attention forward pass.
-    
+
     Args:
         q, k, v: Query, Key, Value tensors [B, S, H, D]
         num_q_clusters: Number of query clusters

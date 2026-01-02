@@ -19,6 +19,9 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     USPAttention,
     USPAttention_SVG2,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.svg2_sparse_attn import (
+    SVG2SparseAttentionMetadata,
+)
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
     LayerNormScaleShift,
@@ -769,8 +772,22 @@ class WanTransformerBlock_SVG2(nn.Module):
             query, cos, sin, is_neox_style=False
         ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
         
+        # Get current timestep from context for SVG2
+        # This is critical for:
+        # 1. Deciding when to use sparse vs full attention (first_times_fp)
+        # 2. Reusing centroids across timesteps (temporal coherence)
+        from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+        context = get_forward_context()
+        # Note: num_frames and num_tokens are not used by the current SVG2 kernel 
+        # (which treats all tokens as a flat set), so we can pass 0 safely.
+        attn_metadata = SVG2SparseAttentionMetadata(
+            current_timestep=context.current_timestep if hasattr(context, "current_timestep") else 0,
+            num_frames=0,
+            num_tokens_per_frame=0,
+        )
+
         # SVG2 attention
-        attn_output = self.attn1(query, key, value)
+        attn_output = self.attn1(query, key, value, attn_metadata=attn_metadata)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
