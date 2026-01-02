@@ -503,195 +503,142 @@ def identify_dynamic_mask(
 
 
 @triton.jit
-def _dynamic_block_sparse_fwd_kernel(
-    Q,
-    K,
-    V,
-    Out,
-    dynamic_map,
-    qc_cum_size,
-    kc_cum_size,
-    stride_qb,
-    stride_qh,
-    stride_qs,
-    stride_qd,
-    stride_kb,
-    stride_kh,
-    stride_ks,
-    stride_kd,
-    stride_vb,
-    stride_vh,
-    stride_vs,
-    stride_vd,
-    stride_ob,
-    stride_oh,
-    stride_os,
-    stride_od,
-    stride_dmap_b,
-    stride_dmap_h,
-    stride_dmap_qc,
-    stride_dmap_kc,
-    stride_qcs_b,
-    stride_qcs_h,
-    stride_qcs_qc,
-    stride_kcs_b,
-    stride_kcs_h,
-    stride_kcs_kc,
-    B,
-    H,
-    S,
-    D,
-    scale,
-    QC_NUM,
-    KC_NUM,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+def _sparse_attn_csr_kernel(
+    Q, K, V, Out,
+    # CSR Indices
+    kv_indices_ptr, # [NNZ] int32
+    q_indptr_ptr,   # [B*H*QC + 1] int32
+    # Cumulative Sizes
+    qc_cum_size, kc_cum_size,
+    # Strides
+    stride_qb, stride_qh, stride_qs, stride_qd,
+    stride_kb, stride_kh, stride_ks, stride_kd,
+    stride_vb, stride_vh, stride_vs, stride_vd,
+    stride_ob, stride_oh, stride_os, stride_od,
+    stride_qcs_b, stride_qcs_h, stride_qcs_qc,
+    stride_kcs_b, stride_kcs_h, stride_kcs_kc,
+    # Meta
+    H, QC_NUM, 
+    sm_scale,
+    # Block Constants
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr
 ):
-    """
-    Triton kernel for dynamic block sparse attention.
-    Each program computes attention for one query block within a batch/head.
-    Processes query block in chunks of BLOCK_M.
-    Iterates through key blocks, checking dynamic_map.
-    Processes key/value blocks in chunks of BLOCK_N.
-    Uses online softmax.
-    """
-    # --- Grid Calculation ---
-    # Each program instance handles one query block for a specific batch and head
-    pid = tl.program_id(axis=0)
-
-    # Calculate batch, head, and query block index
-    pid_q_block_global = pid  # 0 to B*H*QC_NUM - 1
+    # pid 对应一个具体的 Q 簇 (展平后的视图: batch * head * q_cluster)
+    pid = tl.program_id(0)
     
-    # Need to map pid (0.. B*H*QC_NUM-1) back to (b, h, q_block_idx)
-    # q_block_idx changes fastest, then h, then b
-    q_block_idx = pid_q_block_global % QC_NUM
-    pid_h_temp = pid_q_block_global // QC_NUM
-    h = pid_h_temp % H
-    b = pid_h_temp // H
-
-    # --- Load Q block info (start/end offsets) ---
-    qcs_offset = b * stride_qcs_b + h * stride_qcs_h
-    q_start_offset = tl.load(qc_cum_size + qcs_offset + q_block_idx * stride_qcs_qc)
-    q_end_offset = tl.load(qc_cum_size + qcs_offset + (q_block_idx + 1) * stride_qcs_qc)
-    q_block_size = q_end_offset - q_start_offset
-
-    # Early exit if the query block is empty
-    if q_block_size == 0:
+    # 反解坐标
+    q_block_idx = pid % QC_NUM
+    pid_bh = pid // QC_NUM
+    h = pid_bh % H
+    b = pid_bh // H
+    
+    # --- 1. 获取任务范围 (CSR Planning 的结果) ---
+    # q_indptr 告诉我们：在这个 CSR 数组里，属于我这个 pid 的 K 块是从哪到哪
+    csr_start = tl.load(q_indptr_ptr + pid)
+    csr_end = tl.load(q_indptr_ptr + pid + 1)
+    
+    # 如果没有 K 块要处理，直接返回 (Zero-overhead for empty rows)
+    if csr_end == csr_start:
         return
 
-    # --- Pointers setup ---
-    q_ptr_base = Q + b * stride_qb + h * stride_qh + q_start_offset * stride_qs
-    k_ptr_base = K + b * stride_kb + h * stride_kh
-    v_ptr_base = V + b * stride_vb + h * stride_vh
-    out_ptr_base = Out + b * stride_ob + h * stride_oh + q_start_offset * stride_os
-    dmap_ptr = dynamic_map + b * stride_dmap_b + h * stride_dmap_h + q_block_idx * stride_dmap_qc
-    kcs_ptr = kc_cum_size + b * stride_kcs_b + h * stride_kcs_h
+    # --- 2. Q Block 定位 ---
+    qcs_offset = b * stride_qcs_b + h * stride_qcs_h
+    q_start = tl.load(qc_cum_size + qcs_offset + q_block_idx * stride_qcs_qc)
+    q_end = tl.load(qc_cum_size + qcs_offset + (q_block_idx + 1) * stride_qcs_qc)
+    q_len = q_end - q_start
+    
+    if q_len == 0: return
 
-    # --- Iterate over the query block rows in chunks of BLOCK_M ---
-    offs_qm = tl.arange(0, BLOCK_M)  # Query block row offsets [0, 1, ..., BLOCK_M-1]
-    offs_d = tl.arange(0, BLOCK_D)  # Dimension offsets [0, 1, ..., BLOCK_D-1]
+    # 指针初始化
+    q_base = Q + b * stride_qb + h * stride_qh + q_start * stride_qs
+    k_base = K + b * stride_kb + h * stride_kh
+    v_base = V + b * stride_vb + h * stride_vh
+    out_base = Out + b * stride_ob + h * stride_oh + q_start * stride_os
+    
+    kcs_base_ptr = kc_cum_size + b * stride_kcs_b + h * stride_kcs_h
 
-    for q_chunk_start in range(0, q_block_size, BLOCK_M):
-        q_chunk_rows = offs_qm + q_chunk_start
-        q_rows_mask = q_chunk_rows < q_block_size  # Mask for valid rows in this Q chunk [BLOCK_M]
+    # --- 3. Q 切分循环 ---
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_D)
+    
+    for q_chunk_start in range(0, q_len, BLOCK_M):
+        q_rows = q_chunk_start + offs_m
+        q_mask = q_rows < q_len
+        
+        # 加载 Q Chunk
+        q_ptr = q_base + q_rows[:, None] * stride_qs + offs_d[None, :]
+        q_chunk = tl.load(q_ptr, mask=q_mask[:, None] & (offs_d[None, :] < BLOCK_D), other=0.0)
+        
+        # Online Softmax 累加器
+        m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+        
+        # --- 4. K 块遍历 (基于 CSR 索引) ---
+        # 这里的循环次数 = 活跃 K 块的数量，没有浪费！
+        for csr_idx in range(csr_start, csr_end):
+            # 获取真实的 K Block ID
+            k_block_idx = tl.load(kv_indices_ptr + csr_idx)
+            
+            # 获取 K Block 长度信息
+            k_start = tl.load(kcs_base_ptr + k_block_idx * stride_kcs_kc)
+            k_end = tl.load(kcs_base_ptr + (k_block_idx + 1) * stride_kcs_kc)
+            k_len = k_end - k_start
+            
+            if k_len > 0:
+                k_chunk_ptr = k_base + k_start * stride_ks
+                v_chunk_ptr = v_base + k_start * stride_vs
+                
+                # --- 5. K 切分循环 (FlashAttention Core) ---
+                offs_n = tl.arange(0, BLOCK_N)
+                for k_chunk_start in range(0, k_len, BLOCK_N):
+                    k_rows = k_chunk_start + offs_n
+                    k_mask = k_rows < k_len
+                    
+                    k_ptr = k_chunk_ptr + k_rows[:, None] * stride_ks + offs_d[None, :]
+                    v_ptr = v_chunk_ptr + k_rows[:, None] * stride_vs + offs_d[None, :]
+                    
+                    # Ensure we don't read out of bounds for D dim
+                    load_mask = k_mask[:, None] & (offs_d[None, :] < BLOCK_D)
+                    k_chunk = tl.load(k_ptr, mask=load_mask, other=0.0)
+                    v_chunk = tl.load(v_ptr, mask=load_mask, other=0.0)
+                    
+                    # QK^T
+                    qk = tl.dot(q_chunk, tl.trans(k_chunk))
+                    qk *= sm_scale
+                    
+                    # Masking (inf) - critical for padded K rows
+                    qk = tl.where(q_mask[:, None] & k_mask[None, :], qk, float("-inf"))
+                    
+                    # Online Softmax
+                    m_curr = tl.max(qk, 1)
+                    m_new = tl.maximum(m_i, m_curr)
+                    
+                    # p = exp(qk - m_new)
+                    p = tl.exp(qk - m_new[:, None])
+                    
+                    # alpha = exp(m_prev - m_new)
+                    alpha = tl.exp(m_i - m_new)
+                    
+                    # Update l_i
+                    l_i = l_i * alpha + tl.sum(p, 1)
+                    m_i = m_new
+                    
+                    # Update accumulator
+                    # Check dtype for p @ v
+                    p = p.to(v_chunk.dtype)
+                    acc = acc * alpha[:, None] + tl.dot(p, v_chunk)
 
-        # --- Initialize accumulators for this Q chunk ---
-        m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")  # Max score
-        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)  # Sum of exp(scores - max)
-        acc_o = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)  # Accumulated output
-
-        # --- Load Q chunk ---
-        q_ptr = q_ptr_base + q_chunk_rows[:, None] * stride_qs + offs_d[None, :]
-        # Mask ensures we don't read out of bounds for the query block or dimension D
-        mask_q = q_rows_mask[:, None] & (offs_d[None, :] < D)
-        q_chunk = tl.load(q_ptr, mask=mask_q, other=0.0)  # Shape: [BLOCK_M, BLOCK_D]
-
-        # --- Inner loop over K blocks (columns in the block sparse map) ---
-        for k_block_idx in range(0, KC_NUM):
-            # --- Check dynamic_map: Is this block active? ---
-            is_active = tl.load(dmap_ptr + k_block_idx * stride_dmap_kc)
-            if is_active:  # Process block only if it's active
-                # --- Load K block info (start/end offsets) ---
-                k_start_offset = tl.load(kcs_ptr + k_block_idx * stride_kcs_kc)
-                k_end_offset = tl.load(kcs_ptr + (k_block_idx + 1) * stride_kcs_kc)
-                k_block_size = k_end_offset - k_start_offset
-
-                # Skip if the key block is empty (inside the active block check)
-                if k_block_size > 0:
-
-                    k_block_ptr_base = k_ptr_base + k_start_offset * stride_ks
-                    v_block_ptr_base = v_ptr_base + k_start_offset * stride_vs
-
-                    # --- Loop over K block chunks (size BLOCK_N) ---
-                    offs_kn = tl.arange(0, BLOCK_N)  # Key block row offsets [0, ..., BLOCK_N-1]
-                    for k_chunk_start in range(0, k_block_size, BLOCK_N):
-                        k_chunk_rows = offs_kn + k_chunk_start
-                        k_rows_mask = k_chunk_rows < k_block_size  # Mask for valid rows in this K/V chunk [BLOCK_N]
-
-                        # --- Load K, V chunks ---
-                        k_ptr = k_block_ptr_base + k_chunk_rows[:, None] * stride_ks + offs_d[None, :]
-                        v_ptr = v_block_ptr_base + k_chunk_rows[:, None] * stride_vs + offs_d[None, :]
-
-                        # Mask ensures we don't read out of bounds for the key block or dimension D
-                        mask_kv = k_rows_mask[:, None] & (offs_d[None, :] < D)
-                        k_chunk = tl.load(k_ptr, mask=mask_kv, other=0.0)  # Shape: [BLOCK_N, BLOCK_D]
-                        v_chunk = tl.load(v_ptr, mask=mask_kv, other=0.0)  # Shape: [BLOCK_N, BLOCK_D]
-
-                        # --- Compute Scores (Attention) ---
-                        # QK^T: [BLOCK_M, BLOCK_D] @ [BLOCK_D, BLOCK_N] -> [BLOCK_M, BLOCK_N]
-                        s_ij_chunk = tl.dot(q_chunk, k_chunk.T) * scale
-
-                        # IMPORTANT: Mask out scores corresponding to padding in K before max/softmax
-                        # Set scores for invalid K elements to -inf
-                        s_ij_chunk = tl.where(k_rows_mask[None, :], s_ij_chunk, -float("inf"))
-                        # Mask out scores for invalid Q elements as well (although q_chunk elements are 0, avoid potential issues)
-                        s_ij_chunk = tl.where(q_rows_mask[:, None], s_ij_chunk, -float("inf"))
-
-                        # --- Online Softmax Update ---
-                        # Current max for this Q-K chunk interaction
-                        m_ij_chunk = tl.max(s_ij_chunk, axis=1)  # Shape: [BLOCK_M]
-
-                        # Update overall max (across K chunks seen so far for this Q chunk)
-                        m_new = tl.maximum(m_i, m_ij_chunk)  # Shape: [BLOCK_M]
-
-                        # Calculate scaled probabilities P_ij = exp(S_ij - m_new)
-                        p_ij_chunk = tl.exp(s_ij_chunk - m_new[:, None])  # Shape: [BLOCK_M, BLOCK_N]
-                        # Zero out probabilities for masked K elements before summing
-                        p_ij_chunk = tl.where(k_rows_mask[None, :], p_ij_chunk, 0.0)
-
-                        # Calculate scaling factor for previous accumulator state
-                        exp_m_diff = tl.exp(m_i - m_new)  # Shape: [BLOCK_M]
-
-                        # Update sum accumulator (denominator L)
-                        l_i_chunk = tl.sum(p_ij_chunk, axis=1)  # Sum probabilities for this chunk, shape [BLOCK_M]
-                        l_i = (l_i * exp_m_diff) + l_i_chunk  # Shape: [BLOCK_M]
-
-                        # Update output accumulator O
-                        # P_ij @ V_j: [BLOCK_M, BLOCK_N] @ [BLOCK_N, BLOCK_D] -> [BLOCK_M, BLOCK_D]
-                        # Ensure p_ij_chunk is the correct dtype for dot product
-                        p_ij_chunk_casted = p_ij_chunk.to(V.dtype.element_ty)
-                        o_chunk = tl.dot(p_ij_chunk_casted, v_chunk)  # Shape: [BLOCK_M, BLOCK_D]
-
-                        acc_o = (acc_o * exp_m_diff[:, None]) + o_chunk  # Shape: [BLOCK_M, BLOCK_D]
-
-                        # Update max for the next K chunk/block
-                        m_i = m_new
-            # End of 'if is_active:' block
-        # --- End of loop over K blocks ---
-
-        # --- Finalize output for this Q chunk ---
-        # Normalize the accumulated output: O = acc_o / l_i
-        # Add epsilon to l_i to avoid division by zero
-        l_i_safe = tl.where(l_i == 0, 1.0, l_i)  # Avoid 0/0 -> NaN
-        o_final_chunk = acc_o / (l_i_safe[:, None])
-        o_final_chunk = tl.where(l_i[:, None] == 0, 0.0, o_final_chunk)  # Ensure output is 0 if l_i was 0
-
-        # --- Write output chunk to global memory ---
-        out_ptr = out_ptr_base + q_chunk_rows[:, None] * stride_os + offs_d[None, :]
-        # Mask ensures we don't write out of bounds for the query block or dimension D
-        mask_out = q_rows_mask[:, None] & (offs_d[None, :] < D)
-        tl.store(out_ptr, o_final_chunk.to(Out.dtype.element_ty), mask=mask_out)
+        # --- 6. 写回 Output ---
+        # Normalize: out = acc / l_i
+        # Avoid div by zero
+        l_i_safe = tl.where(l_i == 0, 1.0, l_i)
+        acc = acc / l_i_safe[:, None]
+        # If l_i was 0, result should be 0
+        acc = tl.where(l_i[:, None] == 0, 0.0, acc)
+        
+        out_ptr = out_base + q_rows[:, None] * stride_os + offs_d[None, :]
+        tl.store(out_ptr, acc.to(Out.dtype.element_ty), mask=q_mask[:, None] & (offs_d[None, :] < BLOCK_D))
 
 
 def block_sparse_attention(
@@ -703,10 +650,7 @@ def block_sparse_attention(
     k_cluster_sizes: torch.Tensor,  # [B, H, Kk]
 ) -> torch.Tensor:
     """
-    Block sparse attention with variable block sizes using Triton.
-    
-    Replaces the previous implementation that used Python loops over blocks.
-    Now uses a single Triton kernel dispatch for the entire batch.
+    Block sparse attention with variable block sizes using Triton CSR kernel.
     """
     B, H, S, D = q.shape
     qc_num = q_cluster_sizes.shape[-1]
@@ -721,10 +665,25 @@ def block_sparse_attention(
     scale = 1.0 / math.sqrt(D)
     
     # Precompute cumulative sizes (keep on device)
-    # Note: original code expected q_cluster_sizes to be used for block boundaries
-    # We create cumulative sizes adding a 0 at the start
-    qc_cum_size = torch.cumsum(torch.cat([torch.zeros_like(q_cluster_sizes[..., :1]), q_cluster_sizes], dim=-1), dim=-1).int()
-    kc_cum_size = torch.cumsum(torch.cat([torch.zeros_like(k_cluster_sizes[..., :1]), k_cluster_sizes], dim=-1), dim=-1).int()
+    # Add a 0 at the start for offsets
+    qc_cum_size = torch.zeros((B, H, qc_num + 1), device=q.device, dtype=torch.int32)
+    qc_cum_size[..., 1:] = torch.cumsum(q_cluster_sizes, dim=-1)
+    
+    kc_cum_size = torch.zeros((B, H, kc_num + 1), device=q.device, dtype=torch.int32)
+    kc_cum_size[..., 1:] = torch.cumsum(k_cluster_sizes, dim=-1)
+    
+    # --- CSR Planning ---
+    # Convert dense mask [B, H, Qc, Kc] to CSR format
+    # Flatten to [Rows, Cols] where Rows = B*H*Qc
+    flat_mask = block_mask.view(-1, kc_num)
+    
+    # Convert to Sparse CSR Tensor
+    # Note: Input to to_sparse_csr must be float/int/complex, bool not always supported directly
+    sparse_mask = flat_mask.float().to_sparse_csr()
+    
+    # Extract CSR components
+    q_indptr = sparse_mask.crow_indices().int()
+    kv_indices = sparse_mask.col_indices().int()
     
     # Output tensor
     out = torch.empty_like(q)
@@ -739,37 +698,28 @@ def block_sparse_attention(
         BLOCK_M = 64
         BLOCK_N = 64
     else:
-        BLOCK_M = 128
+        BLOCK_M = 64 # Tuned down from 128 for safety
         BLOCK_N = 64
         
     BLOCK_M = min(BLOCK_M, S)
     BLOCK_N = min(BLOCK_N, S)
     
     # Launch grid: One program per query block per batch/head
+    # Note: Using flattened QC_NUM dimension
     grid = (B * H * qc_num,)
     
-    _dynamic_block_sparse_fwd_kernel[grid](
-        q,
-        k,
-        v,
-        out,
-        block_mask,
-        qc_cum_size,
-        kc_cum_size,
+    _sparse_attn_csr_kernel[grid](
+        q, k, v, out,
+        kv_indices, q_indptr,
+        qc_cum_size, kc_cum_size,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        block_mask.stride(0), block_mask.stride(1), block_mask.stride(2), block_mask.stride(3),
         qc_cum_size.stride(0), qc_cum_size.stride(1), qc_cum_size.stride(2),
         kc_cum_size.stride(0), kc_cum_size.stride(1), kc_cum_size.stride(2),
-        B,
-        H,
-        S,
-        D,
+        H, qc_num,
         scale,
-        qc_num,  # Pass variable, NOT constant
-        kc_num,  # Pass variable, NOT constant
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
