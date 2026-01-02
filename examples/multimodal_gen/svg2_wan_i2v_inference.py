@@ -257,7 +257,7 @@ def main():
     
     # Optionally add dense baseline
     if args.compare_with_dense:
-        experiments.append(("flash_attn_2", "Dense (FlashAttn2)", "_dense", None))
+        experiments.append(("fa", "Dense (FlashAttn2)", "_dense", None))
     
     benchmark_results = {}
 
