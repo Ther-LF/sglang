@@ -257,7 +257,7 @@ def main():
     
     # Optionally add dense baseline
     if args.compare_with_dense:
-        experiments.append(("fa", "Dense (FlashAttn2)", "_dense", None))
+        experiments.append(("fa2", "Dense (FlashAttn2)", "_dense", None))
     
     benchmark_results = {}
 
@@ -356,10 +356,22 @@ def main():
             traceback.print_exc()
         
         # Cleanup
-        generator.shutdown()
-        del generator
+        if 'generator' in locals():
+            generator.shutdown()
+            del generator
+        
+        # Aggressive cleanup to prevent OOM
         gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        
+        # Optional: wait a bit for memory to settle
+        time.sleep(2)
+        
+        # Print memory status
+        if torch.cuda.is_available():
+            free_mem, total_mem = torch.cuda.mem_get_info()
+            print(f"Memory after cleanup: {free_mem/1024**3:.2f}GB / {total_mem/1024**3:.2f}GB free")
 
     # Print Comparison Summary
     if len(benchmark_results) > 1:
