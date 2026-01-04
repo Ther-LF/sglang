@@ -862,7 +862,8 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         # 3. Transformer blocks
-        attn_backend = get_global_server_args().attention_backend
+        server_args = get_global_server_args()
+        attn_backend = server_args.attention_backend
         attn_backend_lower = attn_backend.lower() if attn_backend else None
         
         if attn_backend_lower == "video_sparse_attn":
@@ -871,9 +872,26 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         elif attn_backend_lower == "svg2_sparse_attn":
             transformer_block = WanTransformerBlock_SVG2
             logger.info("Using WanTransformerBlock_SVG2 (SVG2 Semantic-Aware Sparse Attention)")
+            # Get SVG2 parameters from server_args
+            svg2_params = {
+                "num_q_clusters": getattr(server_args, "num_q_clusters", 64),
+                "num_k_clusters": getattr(server_args, "num_k_clusters", 64),
+                "top_p": getattr(server_args, "top_p_kmeans", 0.5),
+                "kmeans_iters": getattr(server_args, "kmeans_iter_init", 5),
+                "first_layers_fp": getattr(server_args, "first_layers_fp", 0.0),
+                "first_times_fp": getattr(server_args, "first_times_fp", 0.0),
+                "total_layers": config.num_layers,
+                "total_timesteps": 1000,  # Standard diffusion timesteps
+            }
+            logger.info(f"SVG2 Sparse Attention Config:")
+            logger.info(f"  num_q_clusters={svg2_params['num_q_clusters']}, num_k_clusters={svg2_params['num_k_clusters']}")
+            logger.info(f"  top_p={svg2_params['top_p']}, kmeans_iters={svg2_params['kmeans_iters']}")
+            logger.info(f"  first_layers_fp={svg2_params['first_layers_fp']} -> threshold={int(svg2_params['first_layers_fp'] * svg2_params['total_layers'])}/{svg2_params['total_layers']} layers")
+            logger.info(f"  first_times_fp={svg2_params['first_times_fp']} -> timestep_threshold={int((1.0 - svg2_params['first_times_fp']) * svg2_params['total_timesteps'])}/{svg2_params['total_timesteps']}")
         else:
             transformer_block = WanTransformerBlock
             logger.info(f"Using WanTransformerBlock (backend: {attn_backend or 'default'})")
+            svg2_params = {}
         
         self.blocks = nn.ModuleList(
             [
@@ -890,6 +908,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     prefix=f"{config.prefix}.blocks.{i}",
                     attention_type=config.attention_type,
                     sla_topk=config.sla_topk,
+                    **svg2_params,  # Pass SVG2 parameters if using SVG2 backend
                 )
                 for i in range(config.num_layers)
             ]

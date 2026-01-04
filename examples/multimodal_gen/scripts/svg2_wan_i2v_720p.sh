@@ -226,9 +226,9 @@ if [ "$compare_with_dense" = true ]; then
     
     echo ""
     echo "Launching Dense baseline..."
-    run_inference_on_gpu "$gpu_id" "fa2" "" "$log_file" &
+    run_inference_on_gpu "$gpu_id" "fa" "" "$log_file" &
     PIDS+=($!)
-    TASK_NAMES+=("Dense (FA2)")
+    TASK_NAMES+=("Dense (FA)")
 fi
 
 # Wait for all background processes to complete

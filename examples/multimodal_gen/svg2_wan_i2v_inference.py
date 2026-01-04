@@ -234,8 +234,8 @@ def main():
         suffix = f"_p{top_p:.1f}".replace('.', '')
     elif backend in ["fa", "fa2", "flash_attn_2"]:
         # Dense Config
-        # Normalize backend name to fa2 for sglang
-        backend = "fa2" 
+        # Normalize backend name to fa for sglang
+        backend = "fa" 
         label = "Dense (FlashAttn2)"
         suffix = "_dense"
     else:
