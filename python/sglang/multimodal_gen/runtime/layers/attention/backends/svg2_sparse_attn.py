@@ -1086,8 +1086,8 @@ class SVG2SparseAttentionImpl(AttentionImpl):
     DEFAULT_TOP_P = 0.5
     DEFAULT_KMEANS_ITERS = 5
     DEFAULT_MAX_K_CLUSTERS_PER_Q: Optional[int] = None
-    DEFAULT_FIRST_LAYERS_FP = 0  # Number of first layers using full attention
-    DEFAULT_FIRST_TIMES_FP = 0   # Timestep threshold (timesteps > this use full attention)
+    DEFAULT_FIRST_LAYERS_FP = 0.0  # Ratio of first layers using full attention
+    DEFAULT_FIRST_TIMES_FP = 0.0   # Ratio of first timesteps using full attention
     
     def __init__(
         self,
@@ -1103,8 +1103,10 @@ class SVG2SparseAttentionImpl(AttentionImpl):
         top_p: float = 0.5,
         kmeans_iters: int = 5,
         max_k_clusters_per_q: Optional[int] = None,
-        first_layers_fp: int = 0,
-        first_times_fp: float = 0,
+        first_layers_fp: float = 0.0,  # Ratio of first layers using full attention
+        first_times_fp: float = 0.0,   # Ratio of first timesteps using full attention
+        total_layers: int = 40,        # Total number of transformer layers
+        total_timesteps: int = 1000,   # Total timesteps in diffusion
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
@@ -1120,8 +1122,20 @@ class SVG2SparseAttentionImpl(AttentionImpl):
         self.top_p = top_p
         self.kmeans_iters = kmeans_iters
         self.max_k_clusters_per_q = max_k_clusters_per_q
+        
+        # Convert ratios to actual thresholds
+        self.total_layers = total_layers
+        self.total_timesteps = total_timesteps
         self.first_layers_fp = first_layers_fp
         self.first_times_fp = first_times_fp
+        
+        # first_layers_threshold: layers 0 to threshold-1 use full attention
+        self.first_layers_threshold = int(first_layers_fp * total_layers)
+        # first_times_threshold: timesteps > threshold use full attention
+        # Diffusion timesteps decrease from total_timesteps to 0
+        # first_times_fp=0.35 means first 35% of timesteps (high values) use full attention
+        # So threshold = total_timesteps * (1 - first_times_fp)
+        self.first_times_threshold = int((1.0 - first_times_fp) * total_timesteps)
         
         # Centroid cache for iterative refinement across timesteps
         self.q_centroids = None
@@ -1130,6 +1144,14 @@ class SVG2SparseAttentionImpl(AttentionImpl):
         
         # Extract layer index from prefix if available
         self.layer_idx = self._extract_layer_idx(prefix)
+        
+        # Log configuration on first layer only
+        if self.layer_idx == 0:
+            logger.info(f"SVG2 Sparse Attention Config:")
+            logger.info(f"  num_q_clusters={num_q_clusters}, num_k_clusters={num_k_clusters}")
+            logger.info(f"  top_p={top_p}, kmeans_iters={kmeans_iters}")
+            logger.info(f"  first_layers_fp={first_layers_fp} -> threshold={self.first_layers_threshold}/{total_layers} layers")
+            logger.info(f"  first_times_fp={first_times_fp} -> timestep_threshold={self.first_times_threshold}/{total_timesteps}")
     
     def _extract_layer_idx(self, prefix: str) -> int:
         """Extract layer index from prefix string like 'blocks.5.attn1'."""
@@ -1147,18 +1169,19 @@ class SVG2SparseAttentionImpl(AttentionImpl):
         Determine if full attention should be used based on layer/timestep.
         
         Matching original SVG logic:
-        - if layer_idx < first_layers_fp: use full attention
-        - if timestep > first_times_fp: use full attention
+        - if layer_idx < first_layers_threshold: use full attention
+        - if timestep > first_times_threshold: use full attention
         
-        Note: timestep decreases from ~1000 to 0 during inference,
-        so timestep > threshold means early inference steps.
+        Note: timestep decreases from total_timesteps to 0 during inference,
+        so timestep > threshold means early inference steps (warm-up phase).
         """
         # First N layers always use full attention
-        if self.layer_idx < self.first_layers_fp:
+        if self.layer_idx < self.first_layers_threshold:
             return True
         
         # Early timesteps (high values) use full attention
-        if timestep is not None and timestep > self.first_times_fp:
+        # timestep > threshold means we're in the early warm-up phase
+        if timestep is not None and timestep > self.first_times_threshold:
             return True
         
         return False

@@ -1189,6 +1189,22 @@ class DenoisingStage(PipelineStage):
             attn_metadata = self.attn_metadata_builder.build(
                 raw_latent_shape=batch.raw_latent_shape
             )
+        elif self.attn_backend.get_enum() == AttentionBackendEnum.SVG2_SPARSE_ATTN:
+            # Build SVG2 attention metadata with timestep and SVG2 parameters
+            num_frames = batch.raw_latent_shape[2] if len(batch.raw_latent_shape) > 2 else 1
+            h, w = batch.raw_latent_shape[3], batch.raw_latent_shape[4] if len(batch.raw_latent_shape) > 4 else (batch.raw_latent_shape[2], batch.raw_latent_shape[3])
+            patch_size = server_args.pipeline_config.dit_config.patch_size
+            num_tokens_per_frame = (h // patch_size[1]) * (w // patch_size[2])
+            
+            attn_metadata = self.attn_metadata_builder.build(
+                current_timestep=i,
+                num_frames=num_frames,
+                num_tokens_per_frame=num_tokens_per_frame,
+                num_q_clusters=server_args.num_q_clusters,
+                num_k_clusters=server_args.num_k_clusters,
+                top_p=server_args.top_p_kmeans,
+                kmeans_iters=server_args.kmeans_iter_step,
+            )
         else:
             return None
 

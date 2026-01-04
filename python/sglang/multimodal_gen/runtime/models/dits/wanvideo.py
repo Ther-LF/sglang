@@ -631,8 +631,10 @@ class WanTransformerBlock_SVG2(nn.Module):
         num_k_clusters: int = 64,
         top_p: float = 0.5,
         kmeans_iters: int = 5,
-        first_layers_fp: int = 0,
-        first_times_fp: float = 0,
+        first_layers_fp: float = 0.0,  # Ratio of first layers using full attention
+        first_times_fp: float = 0.0,   # Ratio of first timesteps using full attention
+        total_layers: int = 40,        # Total number of transformer layers
+        total_timesteps: int = 1000,   # Total timesteps in diffusion
         **kwargs,
     ):
         super().__init__()
@@ -657,6 +659,8 @@ class WanTransformerBlock_SVG2(nn.Module):
             kmeans_iters=kmeans_iters,
             first_layers_fp=first_layers_fp,
             first_times_fp=first_times_fp,
+            total_layers=total_layers,
+            total_timesteps=total_timesteps,
         )
 
         self.hidden_dim = dim
