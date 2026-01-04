@@ -93,6 +93,7 @@ def parse_args():
     )
     
     # SVG2 specific parameters (matching original SVG)
+    
     parser.add_argument(
         "--attention-backend",
         type=str,
