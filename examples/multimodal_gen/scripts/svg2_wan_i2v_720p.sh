@@ -2,27 +2,8 @@
 # SVG2 WAN I2V 720p Inference Script - Multi-Config Top-p Testing
 # 
 # This script runs WAN I2V inference with SVG2 sparse attention,
-# testing multiple top-p configurations (default: 0.3, 0.5, 0.7, 0.9)
-#
-# Usage Examples:
-#
-#   # Run with default settings (tests 4 top-p values)
-#   ./svg2_wan_i2v_720p.sh
-#
-#   # Custom prompt and image
-#   PROMPT="Your custom prompt" IMAGE_PATH="your_image.jpg" ./svg2_wan_i2v_720p.sh
-#
-#   # Custom top-p values
-#   TOP_P_VALUES="0.5,0.7,0.9" ./svg2_wan_i2v_720p.sh
-#
-#   # Test specific prompt from examples
-#   PROMPT_ID=2 ./svg2_wan_i2v_720p.sh
-#
-#   # Include dense baseline for comparison
-#   COMPARE_WITH_DENSE=true ./svg2_wan_i2v_720p.sh
-#
-#   # Combine options
-#   TOP_P_VALUES="0.7,0.9" COMPARE_WITH_DENSE=true PROMPT_ID=3 ./svg2_wan_i2v_720p.sh
+# testing multiple top-p configurations by running separate processes
+# to avoid OOM issues.
 
 set -e
 
@@ -77,104 +58,111 @@ fi
 
 output_dir="outputs/svg2/wan_i2v"
 
-# Build output path with configuration info (multi top-p test)
+# Build output path with configuration info
 video_cfg="Step_${infer_step}-Res_${resolution}"
 dense_attention_cfg="TFP_${first_times_fp}-LFP_${first_layers_fp}"
-centroid_cfg="QC_${qc_kmeans}-KC_${kc_kmeans}-TopP_Multi"  # Multiple top-p values
+centroid_cfg="QC_${qc_kmeans}-KC_${kc_kmeans}-TopP_Multi" 
 kmeans_cfg="Init_${kmeans_iter_init}-Step_${kmeans_iter_step}-MinR_${min_kc_ratio}"
 output_feature="${video_cfg}/${dense_attention_cfg}/${centroid_cfg}/${kmeans_cfg}"
+full_output_dir="${output_dir}/${output_feature}"
 
 # ===== Hardware Settings =====
 num_gpus=${NUM_GPUS:-1}
 
 # ===== Comparison Settings =====
-compare_with_dense=${COMPARE_WITH_DENSE:-false}  # Set to true to also run dense baseline
+compare_with_dense=${COMPARE_WITH_DENSE:-false}
 
 # ===== Model Settings =====
 model_id=${MODEL_ID:-"/mnt/gemininjceph3/geminicephfs/mmsearch-luban-universal/group_libra/user_spanaluo/opensource_model/Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"}
 
-# ===== Run Inference =====
+# ===== Helper Function =====
+run_inference() {
+    local backend=$1
+    local top_p=$2
+    
+    echo "----------------------------------------------------------------"
+    echo "Running Inference with Backend: $backend"
+    if [ -n "$top_p" ]; then
+        echo "Top-p: $top_p"
+    fi
+    echo "----------------------------------------------------------------"
+
+    # Build base arguments
+    local args=(
+        python "${SCRIPT_DIR}/../svg2_wan_i2v_inference.py"
+        --model-path "$model_id"
+        --prompt "$prompt"
+        --image-path "$image_path"
+        --seed 0
+        --num-inference-steps $infer_step
+        --resolution $resolution
+        --fps $fps
+        --attention-backend "$backend"
+        --num-gpus $num_gpus
+        --text-encoder-cpu-offload
+        --pin-cpu-memory
+        --output-path "$full_output_dir"
+        --output-filename "${prompt_id}-0.mp4"
+    )
+
+    # Add SVG2 arguments if backend is svg2_sparse_attn
+    if [ "$backend" == "svg2_sparse_attn" ]; then
+        args+=(
+            --num-q-clusters $qc_kmeans
+            --num-k-clusters $kc_kmeans
+            --top-p-kmeans "$top_p"
+            --min-kc-ratio $min_kc_ratio
+            --kmeans-iter-init $kmeans_iter_init
+            --kmeans-iter-step $kmeans_iter_step
+            --first-times-fp $first_times_fp
+            --first-layers-fp $first_layers_fp
+        )
+    fi
+
+    # Run command
+    "${args[@]}"
+    
+    local status=$?
+    if [ $status -eq 0 ]; then
+        echo "Successfully finished: $backend ${top_p}"
+    else
+        echo "Failed: $backend ${top_p}"
+        # We don't exit here to allow other configurations to try running
+    fi
+    
+    # Sleep briefly to ensure OS reclaims all resources
+    sleep 5
+}
+
+# ===== Main Execution Loop =====
 
 echo "========================================"
-echo " SVG2 WAN I2V 720p Inference"
-echo " Multi-Config Top-p Testing"
-echo "========================================"
-echo "Model: $model_id"
-echo "Resolution: $resolution"
-echo "Steps: $infer_step"
-echo "Prompt: $prompt"
-echo "Image: $image_path"
-echo ""
-echo "SVG2 Configuration:"
-echo "  Q Clusters: $qc_kmeans"
-echo "  K Clusters: $kc_kmeans"
-echo "  Top-p Values: $top_p_k"
-echo "  First Times FP: $first_times_fp"
-echo "  First Layers FP: $first_layers_fp"
-echo ""
-echo "Note: Will test all top-p values and"
-echo "      generate separate videos for each."
+echo " SVG2 WAN I2V 720p Inference (Safe Mode)"
+echo " Output: $full_output_dir"
 echo "========================================"
 
 # Create output directory
-mkdir -p "${output_dir}/${output_feature}"
+mkdir -p "$full_output_dir"
 
-# Get script directory and project root
+# Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
-# Build Python command
-cmd=(
-    python "${SCRIPT_DIR}/../svg2_wan_i2v_inference.py"
-    --model-path "$model_id"
-    --prompt "$prompt"
-    --image-path "$image_path"
-    --seed 0
-    --num-inference-steps $infer_step
-    --resolution $resolution
-    --fps $fps
-    --attention-backend svg2_sparse_attn
-    --num-q-clusters $qc_kmeans
-    --num-k-clusters $kc_kmeans
-    --top-p-kmeans "$top_p_k"
-    --min-kc-ratio $min_kc_ratio
-    --kmeans-iter-init $kmeans_iter_init
-    --kmeans-iter-step $kmeans_iter_step
-    --first-times-fp $first_times_fp
-    --first-layers-fp $first_layers_fp
-    --num-gpus $num_gpus
-    --text-encoder-cpu-offload
-    --pin-cpu-memory
-    --output-path "${output_dir}/${output_feature}"
-    --output-filename "${prompt_id}-0.mp4"
-)
-
-# Add dense comparison if requested
-if [ "$compare_with_dense" = true ]; then
-    cmd+=(--compare-with-dense)
-    echo ""
-    echo "Note: Will also run Dense (FlashAttn2) baseline for comparison"
-fi
-
-# Run the command
-"${cmd[@]}"
-
-echo ""
-echo "==========================================="
-echo " Inference Complete!"
-echo "==========================================="
-echo "Output directory: ${output_dir}/${output_feature}/"
-echo ""
-echo "Generated videos:"
-# Parse top_p_k and show expected output files
+# 1. Run SVG2 for each top_p value
 IFS=',' read -ra TOP_P_ARRAY <<< "$top_p_k"
 for p in "${TOP_P_ARRAY[@]}"; do
+    # Remove whitespace
     p_clean=$(echo "$p" | tr -d ' ')
-    p_suffix=$(echo "$p_clean" | tr '.' '')
-    echo "  - ${prompt_id}-0_p${p_suffix}.mp4 (top-p=${p_clean})"
+    if [ -n "$p_clean" ]; then
+        run_inference "svg2_sparse_attn" "$p_clean"
+    fi
 done
-if [ "$compare_with_dense" = true ]; then
-    echo "  - ${prompt_id}-0_dense.mp4 (Dense baseline)"
-fi
-echo "==========================================="
 
+# 2. Run Dense Baseline if requested
+if [ "$compare_with_dense" = true ]; then
+    run_inference "fa2" ""
+fi
+
+echo ""
+echo "==========================================="
+echo " All Tasks Complete!"
+echo "==========================================="
