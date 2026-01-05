@@ -71,37 +71,57 @@ from svg.kmeans_utils import (
     dynamic_block_sparse_fwd_torch as svg_block_sparse_torch,  # PyTorch 参考版本
 )
 
-# 直接导入 permute 模块（因为 svg/kernels/ 缺少 __init__.py）
-# 支持两种目录结构: triton/ 或 triton_ops/
-import importlib.util
+# ============================================================================
+# PyTorch 参考实现作为 Ground Truth（绝对正确的实现）
+# 用于验证 SGLang Triton 实现的正确性
+# ============================================================================
 
-kernels_path = os.path.join(SVG_PATH, "svg", "kernels")
-possible_triton_dirs = ["triton_ops", "triton"]  # 优先检查 triton_ops
-permute_module_path = None
+def pytorch_ref_permute(tensor, labels, dim, sorted_indices=None):
+    """
+    PyTorch 参考实现：按 labels 排序 permute tensor。
+    这是 ground truth，用于验证 Triton 实现的正确性。
+    
+    tensor: [B, H, S, D]
+    labels: [B*H, S]
+    dim: 必须是 2
+    """
+    assert dim == 2, "Only dim=2 is supported"
+    B, H, S, D = tensor.shape
+    BH = B * H
+    
+    if sorted_indices is None:
+        sorted_indices = torch.argsort(labels, dim=-1)
+    
+    # Flatten and permute
+    tensor_flat = tensor.reshape(BH, S, D)
+    
+    # Expand indices for gather
+    gather_idx = sorted_indices.unsqueeze(-1).expand(BH, S, D).long()
+    permuted_flat = torch.gather(tensor_flat, 1, gather_idx)
+    
+    return permuted_flat.reshape(B, H, S, D), sorted_indices
 
-for triton_dir in possible_triton_dirs:
-    candidate = os.path.join(kernels_path, triton_dir, "permute.py")
-    if os.path.exists(candidate):
-        permute_module_path = candidate
-        print(f"Found permute.py at: {permute_module_path}")
-        break
+def pytorch_ref_inverse_permute(permuted_tensor, sorted_indices, dim):
+    """
+    PyTorch 参考实现：逆 permute。
+    这是 ground truth。
+    """
+    assert dim == 2, "Only dim=2 is supported"
+    B, H, S, D = permuted_tensor.shape
+    BH = B * H
+    
+    # Compute inverse indices
+    inverse_indices = torch.argsort(sorted_indices.long(), dim=-1)
+    
+    # Flatten and inverse permute
+    tensor_flat = permuted_tensor.reshape(BH, S, D)
+    gather_idx = inverse_indices.unsqueeze(-1).expand(BH, S, D)
+    original_flat = torch.gather(tensor_flat, 1, gather_idx)
+    
+    return original_flat.reshape(B, H, S, D)
 
-if permute_module_path is None:
-    print(f"ERROR: permute.py not found!")
-    print("\nChecking Sparse-VideoGen structure...")
-    if os.path.exists(kernels_path):
-        print(f"  svg/kernels/ contents: {os.listdir(kernels_path)}")
-        for d in possible_triton_dirs:
-            triton_path = os.path.join(kernels_path, d)
-            if os.path.exists(triton_path):
-                print(f"  svg/kernels/{d}/ contents: {os.listdir(triton_path)}")
-    sys.exit(1)
-
-spec = importlib.util.spec_from_file_location("svg_permute", permute_module_path)
-svg_permute_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(svg_permute_module)
-svg_permute = svg_permute_module.permute_tensor_by_labels_triton
-svg_inverse_permute = svg_permute_module.apply_inverse_permutation_triton
+print("Using PyTorch reference implementation as ground truth for permute functions")
+print("Testing SGLang Triton implementations from svg2_sparse_attn.py")
 
 
 def compute_errors(output, reference, name=""):
@@ -305,9 +325,13 @@ def test_permutation(
     num_clusters=64,
     dtype=torch.bfloat16,
 ):
-    """对比 Permutation 实现"""
+    """
+    对比 Permutation 实现
+    - Ground Truth: PyTorch 参考实现（gather 操作，保证正确）
+    - 被测试: SGLang Triton 实现
+    """
     print("\n" + "="*80)
-    print("TEST 3: Permutation")
+    print("TEST 3: Permutation (SGLang Triton vs PyTorch Reference)")
     print("="*80)
     
     device = 'cuda'
@@ -322,29 +346,27 @@ def test_permutation(
     print(f"Input shape: {x.shape}")
     print(f"Labels shape: {labels.shape}")
     
-    # 标准 SVG permute - 注意它期望 [B, H, S, D] 和 [B*H, S]
-    # 但 svg_permute 的 dim 参数是针对 [cfg, num_heads, seq_len, dim] 的
-    print("\n[SVG Standard] permute_tensor_by_labels_triton...")
-    # SVG 使用 dim=2 表示在 seq_len 维度上排列
-    svg_out, svg_indices = svg_permute(x, labels, dim=2)
-    print(f"  Output shape: {svg_out.shape}")
-    print(f"  Indices shape: {svg_indices.shape}")
+    # PyTorch 参考实现 (Ground Truth)
+    print("\n[Ground Truth] PyTorch Reference permute...")
+    ref_out, ref_indices = pytorch_ref_permute(x, labels, dim=2)
+    print(f"  Output shape: {ref_out.shape}")
+    print(f"  Indices shape: {ref_indices.shape}")
     
-    # SGLang permute
-    print("\n[SGLang] permute_by_labels...")
+    # SGLang Triton 实现 (被测试)
+    print("\n[SGLang Triton] permute_by_labels...")
     sglang_out, sglang_indices = sglang_permute(x, labels=labels)
     print(f"  Output shape: {sglang_out.shape}")
     print(f"  Indices shape: {sglang_indices.shape}")
     
     # 对比
-    print("\n[Comparison]")
-    compute_errors(sglang_out, svg_out, "Permuted Output")
+    print("\n[Comparison: SGLang vs Ground Truth]")
+    compute_errors(sglang_out, ref_out, "Permuted Output")
     
     # 检查 indices 是否一致
-    indices_match = (svg_indices == sglang_indices).all().item()
+    indices_match = (ref_indices.long() == sglang_indices.long()).all().item()
     print(f"  Indices match: {'✓' if indices_match else '✗'}")
     
-    return svg_out, sglang_out, svg_indices, sglang_indices
+    return ref_out, sglang_out, ref_indices, sglang_indices
 
 
 # ============================================================================
@@ -358,9 +380,13 @@ def test_inverse_permutation(
     num_clusters=64,
     dtype=torch.bfloat16,
 ):
-    """对比 Inverse Permutation 实现"""
+    """
+    对比 Inverse Permutation 实现
+    - Ground Truth: PyTorch 参考实现
+    - 被测试: SGLang Triton 实现
+    """
     print("\n" + "="*80)
-    print("TEST 4: Inverse Permutation")
+    print("TEST 4: Inverse Permutation (SGLang Triton vs PyTorch Reference)")
     print("="*80)
     
     device = 'cuda'
@@ -372,36 +398,37 @@ def test_inverse_permutation(
     
     print(f"Input shape: {x.shape}")
     
-    # 先做 permutation
-    svg_perm, svg_indices = svg_permute(x, labels, dim=2)
+    # 先做 permutation (两者使用各自的实现)
+    ref_perm, ref_indices = pytorch_ref_permute(x, labels, dim=2)
     sglang_perm, sglang_indices = sglang_permute(x, labels=labels)
     
     print("After permutation:")
-    print(f"  SVG permuted shape: {svg_perm.shape}")
+    print(f"  Reference permuted shape: {ref_perm.shape}")
     print(f"  SGLang permuted shape: {sglang_perm.shape}")
     
     # 做 inverse permutation
-    print("\n[SVG Standard] apply_inverse_permutation_triton...")
-    svg_inv = svg_inverse_permute(svg_perm, svg_indices, dim=2)
-    print(f"  Output shape: {svg_inv.shape}")
+    print("\n[Ground Truth] PyTorch Reference inverse_permute...")
+    ref_inv = pytorch_ref_inverse_permute(ref_perm, ref_indices, dim=2)
+    print(f"  Output shape: {ref_inv.shape}")
     
-    print("\n[SGLang] inverse_permute...")
+    print("\n[SGLang Triton] inverse_permute...")
     sglang_inv = sglang_inverse_permute(sglang_perm, sglang_indices)
     print(f"  Output shape: {sglang_inv.shape}")
     
     # 对比
-    print("\n[Comparison]")
-    compute_errors(sglang_inv, svg_inv, "Inverse Permuted Output")
+    print("\n[Comparison: SGLang vs Ground Truth]")
+    compute_errors(sglang_inv, ref_inv, "Inverse Permuted Output")
     
     # 检查是否恢复原始输入
-    svg_recover = compute_errors(svg_inv, x, "SVG Recovery (vs original)")
-    sglang_recover = compute_errors(sglang_inv, x, "SGLang Recovery (vs original)")
+    print("\n[Recovery Check]")
+    compute_errors(ref_inv, x, "Reference Recovery (vs original)")
+    compute_errors(sglang_inv, x, "SGLang Recovery (vs original)")
     
-    return svg_inv, sglang_inv
+    return ref_inv, sglang_inv
 
 
 # ============================================================================
-# 测试 5: Block Sparse Attention (使用 PyTorch 参考实现)
+# 测试 5: Block Sparse Attention
 # ============================================================================
 def test_block_sparse_attention(
     batch_size=1,
@@ -413,9 +440,14 @@ def test_block_sparse_attention(
     top_p=0.5,
     dtype=torch.bfloat16,
 ):
-    """对比 Block Sparse Attention 实现"""
+    """
+    对比 Block Sparse Attention 实现
+    - Dense Attention: 完整注意力计算 (最终精度参考)
+    - SVG Standard: svg.kmeans_utils.dynamic_block_sparse_fwd_torch (标准 SVG 实现)
+    - SGLang Triton: 你的 block_sparse_attention 实现 (被测试)
+    """
     print("\n" + "="*80)
-    print("TEST 5: Block Sparse Attention")
+    print("TEST 5: Block Sparse Attention (SGLang Triton vs SVG Standard)")
     print("="*80)
     
     device = 'cuda'
@@ -571,16 +603,16 @@ def test_full_svg2_pipeline(
         # Block mask
         block_mask = svg_identify_map(q_centroids, k_centroids, q_sizes, k_sizes, p=top_p)
         
-        # Permutation
-        q_perm, q_idx = svg_permute(q_bhsd, q_labels, dim=2)
-        k_perm, k_idx = svg_permute(k_bhsd, k_labels, dim=2)
-        v_perm, _ = svg_permute(v_bhsd, k_labels, dim=2, sorted_indices=k_idx)
+        # Permutation (使用 PyTorch 参考实现)
+        q_perm, q_idx = pytorch_ref_permute(q_bhsd, q_labels, dim=2)
+        k_perm, k_idx = pytorch_ref_permute(k_bhsd, k_labels, dim=2)
+        v_perm, _ = pytorch_ref_permute(v_bhsd, k_labels, dim=2, sorted_indices=k_idx)
         
-        # Block sparse attention (PyTorch reference)
+        # Block sparse attention (标准 SVG PyTorch 参考实现)
         out_perm = svg_block_sparse_torch(q_perm, k_perm, v_perm, block_mask, q_sizes, k_sizes)
         
-        # Inverse permutation
-        svg_ref_out = svg_inverse_permute(out_perm, q_idx, dim=2)
+        # Inverse permutation (使用 PyTorch 参考实现)
+        svg_ref_out = pytorch_ref_inverse_permute(out_perm, q_idx, dim=2)
         svg_ref_out = svg_ref_out.transpose(1, 2)  # 回到 [B, S, H, D]
     
     print(f"  Output shape: {svg_ref_out.shape}")
