@@ -193,6 +193,9 @@ def triton_kmeans(
     device = x.device
     dtype = x.dtype
     
+    # DEBUG: Print K-Means parameters (only once per forward call)
+    logger.debug(f"[SVG2 Debug] K-Means: N={N}, K={K}, iters={max_iters}, init={'reuse' if init_centroids is not None else 'random'}")
+    
     # Flatten batch dimension for simpler kernel dispatch if possible, 
     # but here we process batch-by-batch or use a batched kernel.
     # Current kernels are unbatched (process one set of points).
@@ -484,11 +487,20 @@ def identify_dynamic_mask(
     remove_indices[..., 0] = False # Always keep at least the most important one
     
     # 8. Min Ratio Protection
+    preserve_length = 0
     if min_kc_ratio > 0:
         preserve_length = int(min_kc_ratio * Kk)
         remove_indices[..., :preserve_length] = False
         
     sorted_clusters_to_keep = ~remove_indices
+    
+    # DEBUG: Print top-p selection stats
+    kept_per_q = sorted_clusters_to_keep.sum(dim=-1).float()
+    logger.info(f"[SVG2 Debug] Top-P Selection (p={top_p}, min_kc_ratio={min_kc_ratio}):")
+    logger.info(f"  Total K clusters: {Kk}")
+    logger.info(f"  Preserve length (min_kc_ratio): {preserve_length}")
+    logger.info(f"  Kept K per Q: min={kept_per_q.min().item():.0f}, max={kept_per_q.max().item():.0f}, mean={kept_per_q.mean().item():.1f}")
+    logger.info(f"  Avg selection ratio: {kept_per_q.mean().item()/Kk*100:.2f}%")
     
     # 9. Map back to original indices
     block_mask = torch.zeros((B, H, Kq, Kk), device=device, dtype=torch.bool)
@@ -851,6 +863,17 @@ def block_sparse_attention(
     
     out = torch.empty_like(q)
     
+    # DEBUG: Print sparse attention stats
+    total_q_tokens = B * H * S
+    total_kv_work = total_active_k_tokens
+    dense_kv_work = B * H * QC * S  # If all blocks were active
+    sparsity_ratio = 1.0 - (total_kv_work / dense_kv_work) if dense_kv_work > 0 else 0.0
+    logger.info(f"[SVG2 Debug] Sparse Attention Compute:")
+    logger.info(f"  Total Q tiles: {total_q_tiles}")
+    logger.info(f"  Active K tokens: {total_active_k_tokens}/{dense_kv_work} ({100*(1-sparsity_ratio):.2f}%)")
+    logger.info(f"  Compute sparsity: {sparsity_ratio*100:.2f}%")
+    logger.info(f"  Split-K factor: {split_k}")
+    
     # === RUNNING PHASE 1: COMPUTE ===
     # Grid: One thread block per Split per Task
     grid_compute = (total_q_tiles * split_k, )
@@ -973,6 +996,17 @@ def svg2_attention_forward(
         top_p=top_p,
         max_k_clusters_per_q=max_k_clusters_per_q,
     )
+    
+    # DEBUG: Print block mask statistics
+    total_blocks = block_mask.numel()
+    active_blocks = block_mask.sum().item()
+    sparsity = 1.0 - (active_blocks / total_blocks)
+    logger.info(f"[SVG2 Debug] Block Mask Stats:")
+    logger.info(f"  Block shape: {block_mask.shape} [B, H, Kq, Kk]")
+    logger.info(f"  Active blocks: {active_blocks}/{total_blocks} ({100*(1-sparsity):.2f}%)")
+    logger.info(f"  Sparsity: {sparsity*100:.2f}%")
+    logger.info(f"  Q cluster sizes: min={q_cluster_sizes.min().item()}, max={q_cluster_sizes.max().item()}, mean={q_cluster_sizes.float().mean().item():.1f}")
+    logger.info(f"  K cluster sizes: min={k_cluster_sizes.min().item()}, max={k_cluster_sizes.max().item()}, mean={k_cluster_sizes.float().mean().item():.1f}")
     
     # Step 3: Permute Q, K, V by cluster labels
     q_perm, q_sorted_indices = permute_by_labels(q, labels=q_labels)
@@ -1222,8 +1256,22 @@ class SVG2SparseAttentionImpl(AttentionImpl):
             max_k_clusters_per_q = self.max_k_clusters_per_q
             timestep = None
         
+        # DEBUG: Print actual parameters being used (only for layer 0 to avoid spam)
+        if self.layer_idx == 0:
+            logger.info(f"[SVG2 Debug Layer {self.layer_idx}] Forward call:")
+            logger.info(f"  Query shape: {query.shape}, dtype: {query.dtype}")
+            logger.info(f"  num_q_clusters={num_q_clusters}, num_k_clusters={num_k_clusters}")
+            logger.info(f"  top_p={top_p}, kmeans_iters={kmeans_iters}")
+            logger.info(f"  max_k_clusters_per_q={max_k_clusters_per_q}")
+            logger.info(f"  timestep={timestep}, first_times_threshold={self.first_times_threshold}")
+            logger.info(f"  first_layers_threshold={self.first_layers_threshold}")
+        
         # Check if we should use full attention (early layers or early timesteps)
-        if self._should_use_full_attention(timestep):
+        use_full_attn = self._should_use_full_attention(timestep)
+        if self.layer_idx == 0:
+            logger.info(f"  use_full_attention={use_full_attn}")
+        
+        if use_full_attn:
             # Use standard scaled dot-product attention
             return self._full_attention(query, key, value)
         
@@ -1241,6 +1289,7 @@ class SVG2SparseAttentionImpl(AttentionImpl):
         current_kmeans_iters = kmeans_iters
         init_q = None
         init_k = None
+        centroid_reuse = False
         
         if self.centroids_initialized and self.q_centroids is not None:
             # Check shape compatibility (batch size might change or be consistent)
@@ -1252,6 +1301,10 @@ class SVG2SparseAttentionImpl(AttentionImpl):
                 # Use fewer iterations for update step (e.g., 1 or 2)
                 # Original SVG uses 1 or similar small number for steps
                 current_kmeans_iters = 1
+                centroid_reuse = True
+        
+        if self.layer_idx == 0:
+            logger.info(f"  centroid_reuse={centroid_reuse}, kmeans_iters={current_kmeans_iters} (config={kmeans_iters})")
         
         output, new_q_centroids, new_k_centroids = svg2_attention_forward(
             query, key, value,
