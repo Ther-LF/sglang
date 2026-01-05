@@ -66,10 +66,15 @@ from svg.kmeans_utils import (
     identify_dynamic_map as svg_identify_map,
     dynamic_block_sparse_fwd_torch as svg_block_sparse_torch,  # PyTorch 参考版本
 )
-from svg.kernels.triton.permute import (
-    permute_tensor_by_labels_triton as svg_permute,
-    apply_inverse_permutation_triton as svg_inverse_permute,
-)
+
+# 直接导入 permute 模块（因为 svg/kernels/ 缺少 __init__.py）
+import importlib.util
+permute_module_path = os.path.join(SVG_PATH, "svg", "kernels", "triton", "permute.py")
+spec = importlib.util.spec_from_file_location("svg_permute", permute_module_path)
+svg_permute_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(svg_permute_module)
+svg_permute = svg_permute_module.permute_tensor_by_labels_triton
+svg_inverse_permute = svg_permute_module.apply_inverse_permutation_triton
 
 
 def compute_errors(output, reference, name=""):
