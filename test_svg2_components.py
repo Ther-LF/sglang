@@ -21,7 +21,30 @@ import torch.nn.functional as F
 
 # 添加路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "python"))
-sys.path.insert(0, "/Users/luofan/Desktop/Sparse-VideoGen")
+
+# 自动检测 Sparse-VideoGen 路径
+# 优先级: 环境变量 > 同级目录 > 常用路径
+SVG_PATHS = [
+    os.environ.get("SVG_PATH", ""),
+    os.path.join(os.path.dirname(__file__), "..", "Sparse-VideoGen"),  # 同级目录
+    os.path.expanduser("~/Sparse-VideoGen"),  # Home 目录
+    "/root/Sparse-VideoGen",  # 服务器常用路径
+    "/Users/luofan/Desktop/Sparse-VideoGen",  # Mac 路径
+]
+SVG_PATH = None
+for p in SVG_PATHS:
+    if p and os.path.exists(os.path.join(p, "svg")):
+        SVG_PATH = p
+        break
+
+if SVG_PATH is None:
+    print("ERROR: Could not find Sparse-VideoGen directory!")
+    print("Please set SVG_PATH environment variable, e.g.:")
+    print("  export SVG_PATH=/path/to/Sparse-VideoGen")
+    sys.exit(1)
+
+print(f"Using Sparse-VideoGen from: {SVG_PATH}")
+sys.path.insert(0, SVG_PATH)
 
 # ============================================================================
 # 导入两边的实现
