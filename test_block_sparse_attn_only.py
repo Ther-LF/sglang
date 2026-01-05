@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "python"))
 # 自动检测 Sparse-VideoGen 路径
 SVG_PATHS = [
     os.environ.get("SVG_PATH", ""),
-    os.path.join(os.path.dirname(__file__), "..", "Sparse-VideoGen"),
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Sparse-VideoGen")),
     os.path.expanduser("~/Sparse-VideoGen"),
     "/root/Sparse-VideoGen",
     "/Users/luofan/Desktop/Sparse-VideoGen",
@@ -30,12 +30,16 @@ SVG_PATHS = [
 SVG_PATH = None
 for p in SVG_PATHS:
     if p and os.path.exists(os.path.join(p, "svg")):
-        SVG_PATH = p
+        SVG_PATH = os.path.abspath(p)
         break
 
 if SVG_PATH is None:
     print("ERROR: Could not find Sparse-VideoGen directory!")
     print("Please set SVG_PATH environment variable")
+    print("Checked paths:")
+    for p in SVG_PATHS:
+        if p:
+            print(f"  - {p}")
     sys.exit(1)
 
 print(f"Using Sparse-VideoGen from: {SVG_PATH}")

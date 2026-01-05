@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "python"))
 # 优先级: 环境变量 > 同级目录 > 常用路径
 SVG_PATHS = [
     os.environ.get("SVG_PATH", ""),
-    os.path.join(os.path.dirname(__file__), "..", "Sparse-VideoGen"),  # 同级目录
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Sparse-VideoGen")),  # 同级目录
     os.path.expanduser("~/Sparse-VideoGen"),  # Home 目录
     "/root/Sparse-VideoGen",  # 服务器常用路径
     "/Users/luofan/Desktop/Sparse-VideoGen",  # Mac 路径
@@ -34,13 +34,17 @@ SVG_PATHS = [
 SVG_PATH = None
 for p in SVG_PATHS:
     if p and os.path.exists(os.path.join(p, "svg")):
-        SVG_PATH = p
+        SVG_PATH = os.path.abspath(p)  # 规范化路径
         break
 
 if SVG_PATH is None:
     print("ERROR: Could not find Sparse-VideoGen directory!")
     print("Please set SVG_PATH environment variable, e.g.:")
     print("  export SVG_PATH=/path/to/Sparse-VideoGen")
+    print("Checked paths:")
+    for p in SVG_PATHS:
+        if p:
+            print(f"  - {p}")
     sys.exit(1)
 
 print(f"Using Sparse-VideoGen from: {SVG_PATH}")
@@ -70,6 +74,22 @@ from svg.kmeans_utils import (
 # 直接导入 permute 模块（因为 svg/kernels/ 缺少 __init__.py）
 import importlib.util
 permute_module_path = os.path.join(SVG_PATH, "svg", "kernels", "triton", "permute.py")
+
+if not os.path.exists(permute_module_path):
+    print(f"ERROR: permute.py not found at: {permute_module_path}")
+    print("\nChecking Sparse-VideoGen structure...")
+    kernels_path = os.path.join(SVG_PATH, "svg", "kernels")
+    if os.path.exists(kernels_path):
+        print(f"  svg/kernels/ contents: {os.listdir(kernels_path)}")
+        triton_path = os.path.join(kernels_path, "triton")
+        if os.path.exists(triton_path):
+            print(f"  svg/kernels/triton/ contents: {os.listdir(triton_path)}")
+        else:
+            print(f"  svg/kernels/triton/ does not exist!")
+    else:
+        print(f"  svg/kernels/ does not exist!")
+    sys.exit(1)
+
 spec = importlib.util.spec_from_file_location("svg_permute", permute_module_path)
 svg_permute_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(svg_permute_module)
