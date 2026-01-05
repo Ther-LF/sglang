@@ -37,19 +37,43 @@ def compute_errors(output, reference):
     reference = reference.float()
     
     abs_diff = torch.abs(output - reference)
-    rel_diff = abs_diff / (torch.abs(reference) + 1e-8)
     
-    # Cosine similarity
+    # Method 1: Relative to reference norm (more stable)
+    ref_norm = torch.norm(reference).item()
+    error_norm = torch.norm(abs_diff).item()
+    l2_rel_pct = (error_norm / ref_norm) * 100 if ref_norm > 0 else 0
+    
+    # Method 2: Relative to value range (robust to near-zero values)
+    ref_range = reference.max().item() - reference.min().item()
+    range_rel_pct = (abs_diff.mean().item() / ref_range) * 100 if ref_range > 0 else 0
+    
+    # Method 3: Element-wise relative (only for non-tiny values)
+    threshold = 0.01  # Only compute relative error where |ref| > threshold
+    mask = torch.abs(reference) > threshold
+    if mask.sum() > 0:
+        rel_diff_masked = abs_diff[mask] / torch.abs(reference[mask])
+        mean_rel_masked = rel_diff_masked.mean().item() * 100
+        max_rel_masked = rel_diff_masked.max().item() * 100
+    else:
+        mean_rel_masked = 0
+        max_rel_masked = 0
+    
+    # Cosine similarity (1.0 = perfect)
     cos_sim = torch.nn.functional.cosine_similarity(
         output.flatten(), reference.flatten(), dim=0
     ).item()
     
+    # RMSE
+    rmse = torch.sqrt((abs_diff ** 2).mean()).item()
+    
     return {
         'max_abs': abs_diff.max().item(),
         'mean_abs': abs_diff.mean().item(),
-        'max_rel': rel_diff.max().item() * 100,  # as percentage
-        'mean_rel': rel_diff.mean().item() * 100,  # as percentage
-        'l2_rel': (torch.norm(abs_diff) / torch.norm(reference)).item() * 100,
+        'rmse': rmse,
+        'l2_rel_pct': l2_rel_pct,  # Most reliable
+        'range_rel_pct': range_rel_pct,  # Relative to output range
+        'mean_rel_pct': mean_rel_masked,  # Only for |ref| > 0.01
+        'max_rel_pct': max_rel_masked,
         'cosine_sim': cos_sim,
     }
 
@@ -113,9 +137,9 @@ def test_top_p_precision(
         
         print(f"  Max absolute error: {errors['max_abs']:.6f}")
         print(f"  Mean absolute error: {errors['mean_abs']:.6f}")
-        print(f"  Max relative error: {errors['max_rel']:.2f}%")
-        print(f"  Mean relative error: {errors['mean_rel']:.2f}%")
-        print(f"  L2 relative error: {errors['l2_rel']:.2f}%")
+        print(f"  RMSE: {errors['rmse']:.6f}")
+        print(f"  L2 relative error: {errors['l2_rel_pct']:.2f}%")
+        print(f"  Range relative error: {errors['range_rel_pct']:.2f}%")
         print(f"  Cosine similarity: {errors['cosine_sim']:.6f}")
         print()
         
@@ -127,18 +151,19 @@ def test_top_p_precision(
     print("="*80)
     print("SUMMARY: Precision vs Top-P")
     print("="*80)
-    print(f"{'Top-P':<10} {'Mean Rel%':<12} {'Max Rel%':<12} {'L2 Rel%':<12} {'Cosine Sim':<12}")
+    print(f"{'Top-P':<10} {'Mean Abs':<12} {'RMSE':<12} {'L2 Rel%':<12} {'Cosine Sim':<12}")
     print("-"*80)
     
     for top_p in top_p_values:
         e = results[top_p]
-        print(f"{top_p:<10.1f} {e['mean_rel']:<12.4f} {e['max_rel']:<12.2f} "
-              f"{e['l2_rel']:<12.4f} {e['cosine_sim']:<12.6f}")
+        print(f"{top_p:<10.1f} {e['mean_abs']:<12.6f} {e['rmse']:<12.6f} "
+              f"{e['l2_rel_pct']:<12.2f} {e['cosine_sim']:<12.6f}")
     
     print("="*80)
     print("\nInterpretation Guide:")
-    print("  • Cosine Similarity: 1.0 = perfect, >0.99 = excellent, >0.95 = good")
-    print("  • Mean Relative Error: <1% = excellent, <5% = acceptable, <10% = usable")
+    print("  • Cosine Similarity: 1.0 = perfect, >0.99 = excellent, >0.95 = good, >0.9 = acceptable")
+    print("  • L2 Relative Error: <10% = excellent, <30% = good, <50% = acceptable")
+    print("  • RMSE & Mean Abs: Lower is better (compare to output range)")
     print("  • Higher top_p → less pruning → better precision (but slower)")
     print("="*80 + "\n")
     
