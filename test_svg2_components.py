@@ -72,22 +72,29 @@ from svg.kmeans_utils import (
 )
 
 # 直接导入 permute 模块（因为 svg/kernels/ 缺少 __init__.py）
+# 支持两种目录结构: triton/ 或 triton_ops/
 import importlib.util
-permute_module_path = os.path.join(SVG_PATH, "svg", "kernels", "triton", "permute.py")
 
-if not os.path.exists(permute_module_path):
-    print(f"ERROR: permute.py not found at: {permute_module_path}")
+kernels_path = os.path.join(SVG_PATH, "svg", "kernels")
+possible_triton_dirs = ["triton_ops", "triton"]  # 优先检查 triton_ops
+permute_module_path = None
+
+for triton_dir in possible_triton_dirs:
+    candidate = os.path.join(kernels_path, triton_dir, "permute.py")
+    if os.path.exists(candidate):
+        permute_module_path = candidate
+        print(f"Found permute.py at: {permute_module_path}")
+        break
+
+if permute_module_path is None:
+    print(f"ERROR: permute.py not found!")
     print("\nChecking Sparse-VideoGen structure...")
-    kernels_path = os.path.join(SVG_PATH, "svg", "kernels")
     if os.path.exists(kernels_path):
         print(f"  svg/kernels/ contents: {os.listdir(kernels_path)}")
-        triton_path = os.path.join(kernels_path, "triton")
-        if os.path.exists(triton_path):
-            print(f"  svg/kernels/triton/ contents: {os.listdir(triton_path)}")
-        else:
-            print(f"  svg/kernels/triton/ does not exist!")
-    else:
-        print(f"  svg/kernels/ does not exist!")
+        for d in possible_triton_dirs:
+            triton_path = os.path.join(kernels_path, d)
+            if os.path.exists(triton_path):
+                print(f"  svg/kernels/{d}/ contents: {os.listdir(triton_path)}")
     sys.exit(1)
 
 spec = importlib.util.spec_from_file_location("svg_permute", permute_module_path)
