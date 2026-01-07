@@ -32,6 +32,17 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 # ============================================================================
+# 尝试导入 SVG 的 K-Means 实现（如果可用）
+# ============================================================================
+_SVG_KMEANS_AVAILABLE = False
+try:
+    from svg.kmeans_utils import batch_kmeans_Euclid as svg_batch_kmeans_Euclid
+    _SVG_KMEANS_AVAILABLE = True
+    logger.info("Using SVG's batch_kmeans_Euclid for K-Means clustering")
+except ImportError:
+    logger.info("SVG K-Means not available, using built-in PyTorch implementation")
+
+# ============================================================================
 # Part 1: Triton Kernels for K-Means Clustering
 # ============================================================================
 
@@ -183,14 +194,7 @@ def triton_kmeans(
     tol: float = 1e-4,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    K-Means clustering matching SVG's batch_kmeans_Euclid exactly.
-    
-    This implementation uses pure PyTorch operations to ensure numerical
-    consistency with SVG's implementation. The key aspects that match SVG:
-    1. Distance computation: ||x||^2 + ||c||^2 - 2 * x @ c.T
-    2. Cluster assignment: argmin over distance
-    3. Centroid update: scatter_add with proper handling of empty clusters
-    4. Convergence check: max norm of center shift
+    K-Means clustering - uses SVG's implementation if available, otherwise falls back to PyTorch.
     
     Args:
         x: Input tensor [B, N, D] or [N, D]
@@ -216,60 +220,68 @@ def triton_kmeans(
     device = x.device
     dtype = x.dtype
     
-    # DEBUG: Print K-Means parameters (only once per forward call)
+    # ========================================================================
+    # 如果 SVG 的 K-Means 可用，直接使用它（保证完全一致）
+    # ========================================================================
+    if _SVG_KMEANS_AVAILABLE:
+        labels, centroids, cluster_sizes, n_iters = svg_batch_kmeans_Euclid(
+            x, n_clusters=n_clusters, max_iters=max_iters, 
+            tol=tol, init_centroids=init_centroids
+        )
+        
+        # Convert to expected dtypes
+        labels = labels.to(torch.int32)
+        cluster_sizes = cluster_sizes.to(torch.int32)
+        
+        if not is_batched:
+            labels = labels.squeeze(0)
+            centroids = centroids.squeeze(0)
+            cluster_sizes = cluster_sizes.squeeze(0)
+        
+        return labels, centroids.to(dtype), cluster_sizes
+    
+    # ========================================================================
+    # Fallback: 使用 PyTorch 实现（当 SVG 不可用时）
+    # ========================================================================
     logger.debug(f"[SVG2 Debug] K-Means: N={N}, K={K}, iters={max_iters}, init={'reuse' if init_centroids is not None else 'random'}")
     
-    # Pre-compute squared L2 norm of all points (constant during iterations)
-    # This matches SVG's approach exactly
+    # Pre-compute squared L2 norm of all points
     x_sq = (x.float() ** 2).sum(dim=-1)  # [B, N]
     
-    # Initialize centroids (matching SVG's initialization exactly)
+    # Initialize centroids
     if init_centroids is not None:
         centroids = init_centroids.clone().float()
     else:
-        # Randomly select initial centers from x (same as SVG)
         indices = torch.randint(0, N, (B, K), device=device)
         centroids = torch.gather(
             x.float(), dim=1, 
             index=indices.unsqueeze(-1).expand(-1, -1, D)
-        )  # [B, K, D]
+        )
     
     centroids = centroids.view(B, K, D).float()
     
     for iteration in range(max_iters):
-        # ============================================================
-        # Step 1: Compute distances and assign clusters (matching SVG)
-        # dist_sq = ||x||^2 + ||c||^2 - 2 * x @ c.T
-        # ============================================================
-        cent_sq = (centroids ** 2).sum(dim=-1)  # [B, K]
-        
-        # x @ c.T: [B, N, D] @ [B, D, K] -> [B, N, K]
+        # Distance computation
+        cent_sq = (centroids ** 2).sum(dim=-1)
         cross = torch.bmm(x.float(), centroids.transpose(1, 2))
-        
-        # dist_sq: [B, N, K]
         dist_sq = x_sq.unsqueeze(-1) + cent_sq.unsqueeze(1) - 2.0 * cross
-        dist_sq = dist_sq.clamp(min=0.0)  # Numerical stability
+        dist_sq = dist_sq.clamp(min=0.0)
         
-        # Assign to nearest centroid
-        labels = dist_sq.argmin(dim=-1)  # [B, N]
+        # Cluster assignment
+        labels = dist_sq.argmin(dim=-1)
         
-        # ============================================================
-        # Step 2: Update centroids (matching SVG's scatter_add approach)
-        # ============================================================
+        # Centroid update
         new_centroids, cluster_sizes = _update_centroids_pytorch(
             x.float(), labels, K, centroids
         )
         
-        # ============================================================
-        # Step 3: Check for convergence (matching SVG's logic)
-        # ============================================================
+        # Convergence check
         center_shift = (new_centroids - centroids).norm(dim=-1).max()
         centroids = new_centroids
         
         if center_shift < tol:
             break
     
-    # Convert labels to int32 for compatibility
     labels = labels.to(torch.int32)
     cluster_sizes = cluster_sizes.to(torch.int32)
     

@@ -856,7 +856,9 @@ def main():
     num_q_clusters = 32
     num_k_clusters = 32
     top_p = 0.5
-    dtype = torch.bfloat16
+    # 使用 float32 进行精度测试，避免 bfloat16 的数值差异
+    # bfloat16 在距离计算中会有舍入误差，导致 K-Means 结果不一致
+    dtype = torch.float32  # 改为 float32 以确保精度一致性
     
     results = {}
     
