@@ -99,7 +99,7 @@ def _pairwise_distance_kernel(
 @triton.jit
 def _assign_clusters_kernel(
     Dist_ptr,        # [N, K]
-    Labels_ptr,      # [N]
+    Labels_ptr,      # [N] - int64
     N: tl.constexpr,
     K: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -112,7 +112,7 @@ def _assign_clusters_kernel(
     
     # Find minimum distance for each point
     min_dist = tl.full((BLOCK_N,), float('inf'), dtype=tl.float32)
-    min_idx = tl.zeros((BLOCK_N,), dtype=tl.int32)
+    min_idx = tl.zeros((BLOCK_N,), dtype=tl.int64)
     
     for k in range(K):
         dist_ptrs = Dist_ptr + n_offsets * K + k
@@ -120,44 +120,59 @@ def _assign_clusters_kernel(
         
         is_smaller = dist < min_dist
         min_dist = tl.where(is_smaller, dist, min_dist)
-        min_idx = tl.where(is_smaller, k, min_idx)
+        min_idx = tl.where(is_smaller, tl.cast(k, tl.int64), min_idx)
     
     # Store labels
     tl.store(Labels_ptr + n_offsets, min_idx, mask=n_mask)
 
 
-@triton.jit
-def _update_centroids_kernel(
-    X_ptr,           # [N, D]
-    Labels_ptr,      # [N]
-    Sum_ptr,         # [K, D]
-    Count_ptr,       # [K]
-    N: tl.constexpr,
-    D: tl.constexpr,
-    K: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    """Accumulate sums and counts for centroid update using atomics."""
-    pid = tl.program_id(0)  # Each program handles one point
+def _update_centroids_pytorch(
+    x: torch.Tensor,       # [B, N, D]
+    labels: torch.Tensor,  # [B, N] int64
+    K: int,
+    old_centroids: torch.Tensor,  # [B, K, D] for empty cluster fallback
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Deterministic centroid update using PyTorch scatter_add.
     
-    if pid >= N:
-        return
+    This matches SVG's triton_centroid_update_sorted_euclid behavior:
+    - Uses scatter_add for deterministic accumulation
+    - Returns centroids in original dtype
+    - Handles empty clusters by keeping old centroids
     
-    # Get cluster assignment
-    label = tl.load(Labels_ptr + pid)
+    Returns:
+        new_centroids: [B, K, D]
+        cluster_sizes: [B, K] int64
+    """
+    B, N, D = x.shape
+    device = x.device
+    dtype = x.dtype
     
-    # Accumulate point's features to centroid sum
-    d_offsets = tl.arange(0, BLOCK_D)
-    for d_start in range(0, D, BLOCK_D):
-        offs = d_start + d_offsets
-        mask = offs < D
-        
-        x_vals = tl.load(X_ptr + pid * D + offs, mask=mask, other=0.0).to(tl.float32)
-        sum_ptrs = Sum_ptr + label * D + offs
-        tl.atomic_add(sum_ptrs, x_vals, mask=mask)
+    # Compute cluster sizes using bincount (deterministic)
+    cluster_sizes = torch.zeros(B, K, dtype=torch.int64, device=device)
+    for b in range(B):
+        counts = torch.bincount(labels[b].long(), minlength=K)
+        cluster_sizes[b] = counts
     
-    # Increment count
-    tl.atomic_add(Count_ptr + label, 1)
+    # Accumulate sums using scatter_add (deterministic)
+    # Expand labels to [B, N, D] for scatter
+    labels_expanded = labels.unsqueeze(-1).expand(-1, -1, D).long()  # [B, N, D]
+    
+    # Initialize sum buffer
+    centroid_sums = torch.zeros(B, K, D, dtype=torch.float32, device=device)
+    
+    # Scatter add features to their cluster
+    centroid_sums.scatter_add_(1, labels_expanded, x.float())
+    
+    # Compute means, handle empty clusters
+    counts_safe = cluster_sizes.clamp(min=1).unsqueeze(-1).float()  # [B, K, 1]
+    new_centroids = centroid_sums / counts_safe
+    
+    # For empty clusters, keep old centroids
+    empty_mask = (cluster_sizes == 0).unsqueeze(-1)  # [B, K, 1]
+    new_centroids = torch.where(empty_mask, old_centroids.float(), new_centroids)
+    
+    return new_centroids.to(dtype), cluster_sizes
 
 
 def triton_kmeans(
@@ -165,16 +180,21 @@ def triton_kmeans(
     n_clusters: int,
     max_iters: int = 10,
     init_centroids: Optional[torch.Tensor] = None,
+    tol: float = 1e-4,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    GPU-accelerated K-Means clustering using Triton.
-    Optimized to minimize memory allocations.
+    GPU-accelerated K-Means clustering matching SVG's batch_kmeans_Euclid.
+    
+    This implementation uses:
+    1. Triton kernels for distance computation and cluster assignment
+    2. PyTorch scatter_add for deterministic centroid updates (matching SVG)
     
     Args:
         x: Input tensor [B, N, D] or [N, D]
         n_clusters: Number of clusters K
         max_iters: Maximum iterations
         init_centroids: Optional initial centroids [B, K, D] or [K, D]
+        tol: Convergence tolerance for center movement
     
     Returns:
         labels: Cluster assignments [B, N] or [N]
@@ -196,37 +216,30 @@ def triton_kmeans(
     # DEBUG: Print K-Means parameters (only once per forward call)
     logger.debug(f"[SVG2 Debug] K-Means: N={N}, K={K}, iters={max_iters}, init={'reuse' if init_centroids is not None else 'random'}")
     
-    # Flatten batch dimension for simpler kernel dispatch if possible, 
-    # but here we process batch-by-batch or use a batched kernel.
-    # Current kernels are unbatched (process one set of points).
-    # To reduce python overhead, ideally we would make kernels batched, 
-    # but for now let's optimize memory allocation.
+    # Pre-compute squared L2 norm of all points (constant during iterations)
+    # This matches SVG's approach
+    x_sq = (x.float() ** 2).sum(dim=-1)  # [B, N]
     
-    x_flat = x.reshape(B * N, D).contiguous()
-    
-    # Initialize centroids
+    # Initialize centroids (matching SVG's initialization)
     if init_centroids is not None:
-        centroids = init_centroids.reshape(B * K, D).clone().float()
+        centroids = init_centroids.clone().float()
     else:
-        # Random initialization
+        # Randomly select initial centers from x (same as SVG)
         indices = torch.randint(0, N, (B, K), device=device)
-        batch_offset = torch.arange(B, device=device)[:, None] * N
-        flat_indices = (batch_offset + indices).flatten()
-        centroids = x_flat[flat_indices].float().clone()
+        centroids = torch.gather(
+            x.float(), dim=1, 
+            index=indices.unsqueeze(-1).expand(-1, -1, D)
+        )  # [B, K, D]
     
-    centroids = centroids.reshape(B, K, D)
-    labels = torch.zeros(B, N, dtype=torch.int32, device=device)
+    centroids = centroids.view(B, K, D).float()
+    labels = torch.zeros(B, N, dtype=torch.int64, device=device)
     
-    # Pre-allocate buffers for the loop to avoid malloc overhead
+    # Pre-allocate distance buffer
     dist_buffer = torch.empty(N, K, dtype=torch.float32, device=device)
-    centroid_sum_buffer = torch.empty(K, D, dtype=torch.float32, device=device)
-    centroid_count_buffer = torch.empty(K, dtype=torch.int32, device=device)
-    x_sqnorm_buffer = torch.empty(N, dtype=torch.float32, device=device)
-    c_sqnorm_buffer = torch.empty(K, dtype=torch.float32, device=device)
     
-    # Kernel config
-    BLOCK_N = 128 # Increased from 32 for better occupancy
-    BLOCK_K = min(128, K) # Increased
+    # Kernel config for distance computation
+    BLOCK_N = 128
+    BLOCK_K = min(128, K)
     BLOCK_D = min(128, triton.next_power_of_2(D))
     
     grid_n = triton.cdiv(N, BLOCK_N)
@@ -234,51 +247,43 @@ def triton_kmeans(
     
     for iteration in range(max_iters):
         # Process each batch
-        # TODO: Ideally fuse batch dimension into kernel grid to avoid Python loop
         for b in range(B):
-            x_b = x[b] # [N, D]
-            c_b = centroids[b] # [K, D]
+            x_b = x[b].float()  # [N, D]
+            c_b = centroids[b]  # [K, D]
+            x_sq_b = x_sq[b]    # [N]
             
-            # Precompute squared norms
-            # torch.sum is fast and optimized
-            torch.sum(x_b * x_b, dim=-1, out=x_sqnorm_buffer)
-            torch.sum(c_b * c_b, dim=-1, out=c_sqnorm_buffer)
+            # Precompute centroid squared norms
+            c_sq_b = (c_b ** 2).sum(dim=-1)  # [K]
             
-            # Step 1: Compute distances
+            # Step 1: Compute distances using Triton
             _pairwise_distance_kernel[(grid_n, grid_k)](
-                x_b, c_b, x_sqnorm_buffer, c_sqnorm_buffer, dist_buffer,
+                x_b, c_b, x_sq_b, c_sq_b, dist_buffer,
                 N, K, D,
                 BLOCK_N, BLOCK_K, BLOCK_D,
             )
             
-            # Step 2: Assign clusters
+            # Step 2: Assign clusters using Triton
             _assign_clusters_kernel[(grid_n,)](
                 dist_buffer, labels[b],
                 N, K, BLOCK_N,
             )
-            
-            # Step 3: Update centroids
-            # Zero out buffers
-            centroid_sum_buffer.zero_()
-            centroid_count_buffer.zero_()
-            
-            _update_centroids_kernel[(N,)](
-                x_b, labels[b], centroid_sum_buffer, centroid_count_buffer,
-                N, D, K, BLOCK_D,
-            )
-            
-            # Update centroids
-            # Avoid division by zero
-            centroid_count_safe = centroid_count_buffer.clamp(min=1)
-            centroids[b] = centroid_sum_buffer / centroid_count_safe[:, None]
+        
+        # Step 3: Update centroids using deterministic PyTorch scatter_add
+        # This matches SVG's triton_centroid_update_sorted_euclid behavior
+        new_centroids, cluster_sizes = _update_centroids_pytorch(
+            x.float(), labels, K, centroids
+        )
+        
+        # Check for convergence (matching SVG's logic)
+        center_shift = (new_centroids - centroids).norm(dim=-1).max()
+        centroids = new_centroids
+        
+        if center_shift < tol:
+            break
     
-    # Compute final cluster sizes
-    cluster_sizes = torch.zeros(B, K, dtype=torch.int32, device=device)
-    for b in range(B):
-        # Using bincount is faster than python loop
-        # labels[b] is [N], values in [0, K-1]
-        counts = torch.bincount(labels[b].long(), minlength=K)
-        cluster_sizes[b] = counts.to(torch.int32)
+    # Convert labels to int32 for compatibility
+    labels = labels.to(torch.int32)
+    cluster_sizes = cluster_sizes.to(torch.int32)
     
     if not is_batched:
         labels = labels.squeeze(0)
