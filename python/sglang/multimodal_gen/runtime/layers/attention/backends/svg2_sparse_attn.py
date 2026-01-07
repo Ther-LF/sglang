@@ -183,11 +183,14 @@ def triton_kmeans(
     tol: float = 1e-4,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    GPU-accelerated K-Means clustering matching SVG's batch_kmeans_Euclid.
+    K-Means clustering matching SVG's batch_kmeans_Euclid exactly.
     
-    This implementation uses:
-    1. Triton kernels for distance computation and cluster assignment
-    2. PyTorch scatter_add for deterministic centroid updates (matching SVG)
+    This implementation uses pure PyTorch operations to ensure numerical
+    consistency with SVG's implementation. The key aspects that match SVG:
+    1. Distance computation: ||x||^2 + ||c||^2 - 2 * x @ c.T
+    2. Cluster assignment: argmin over distance
+    3. Centroid update: scatter_add with proper handling of empty clusters
+    4. Convergence check: max norm of center shift
     
     Args:
         x: Input tensor [B, N, D] or [N, D]
@@ -217,10 +220,10 @@ def triton_kmeans(
     logger.debug(f"[SVG2 Debug] K-Means: N={N}, K={K}, iters={max_iters}, init={'reuse' if init_centroids is not None else 'random'}")
     
     # Pre-compute squared L2 norm of all points (constant during iterations)
-    # This matches SVG's approach
+    # This matches SVG's approach exactly
     x_sq = (x.float() ** 2).sum(dim=-1)  # [B, N]
     
-    # Initialize centroids (matching SVG's initialization)
+    # Initialize centroids (matching SVG's initialization exactly)
     if init_centroids is not None:
         centroids = init_centroids.clone().float()
     else:
@@ -232,49 +235,34 @@ def triton_kmeans(
         )  # [B, K, D]
     
     centroids = centroids.view(B, K, D).float()
-    labels = torch.zeros(B, N, dtype=torch.int64, device=device)
-    
-    # Pre-allocate distance buffer
-    dist_buffer = torch.empty(N, K, dtype=torch.float32, device=device)
-    
-    # Kernel config for distance computation
-    BLOCK_N = 128
-    BLOCK_K = min(128, K)
-    BLOCK_D = min(128, triton.next_power_of_2(D))
-    
-    grid_n = triton.cdiv(N, BLOCK_N)
-    grid_k = triton.cdiv(K, BLOCK_K)
     
     for iteration in range(max_iters):
-        # Process each batch
-        for b in range(B):
-            x_b = x[b].float()  # [N, D]
-            c_b = centroids[b]  # [K, D]
-            x_sq_b = x_sq[b]    # [N]
-            
-            # Precompute centroid squared norms
-            c_sq_b = (c_b ** 2).sum(dim=-1)  # [K]
-            
-            # Step 1: Compute distances using Triton
-            _pairwise_distance_kernel[(grid_n, grid_k)](
-                x_b, c_b, x_sq_b, c_sq_b, dist_buffer,
-                N, K, D,
-                BLOCK_N, BLOCK_K, BLOCK_D,
-            )
-            
-            # Step 2: Assign clusters using Triton
-            _assign_clusters_kernel[(grid_n,)](
-                dist_buffer, labels[b],
-                N, K, BLOCK_N,
-            )
+        # ============================================================
+        # Step 1: Compute distances and assign clusters (matching SVG)
+        # dist_sq = ||x||^2 + ||c||^2 - 2 * x @ c.T
+        # ============================================================
+        cent_sq = (centroids ** 2).sum(dim=-1)  # [B, K]
         
-        # Step 3: Update centroids using deterministic PyTorch scatter_add
-        # This matches SVG's triton_centroid_update_sorted_euclid behavior
+        # x @ c.T: [B, N, D] @ [B, D, K] -> [B, N, K]
+        cross = torch.bmm(x.float(), centroids.transpose(1, 2))
+        
+        # dist_sq: [B, N, K]
+        dist_sq = x_sq.unsqueeze(-1) + cent_sq.unsqueeze(1) - 2.0 * cross
+        dist_sq = dist_sq.clamp(min=0.0)  # Numerical stability
+        
+        # Assign to nearest centroid
+        labels = dist_sq.argmin(dim=-1)  # [B, N]
+        
+        # ============================================================
+        # Step 2: Update centroids (matching SVG's scatter_add approach)
+        # ============================================================
         new_centroids, cluster_sizes = _update_centroids_pytorch(
             x.float(), labels, K, centroids
         )
         
-        # Check for convergence (matching SVG's logic)
+        # ============================================================
+        # Step 3: Check for convergence (matching SVG's logic)
+        # ============================================================
         center_shift = (new_centroids - centroids).norm(dim=-1).max()
         centroids = new_centroids
         
