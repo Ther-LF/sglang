@@ -163,7 +163,7 @@ def dense_attention(q, k, v):
 
 
 # ============================================================================
-# 测试 1: K-Means 聚类
+# 测试 1: K-Means 聚类 (使用相同初始化)
 # ============================================================================
 def test_kmeans(
     batch_size=1,
@@ -174,53 +174,68 @@ def test_kmeans(
     max_iters=10,
     dtype=torch.bfloat16,
 ):
-    """对比两边的 K-Means 实现"""
+    """对比两边的 K-Means 实现 - 使用相同的初始 centroids"""
     print("\n" + "="*80)
-    print("TEST 1: K-Means Clustering")
+    print("TEST 1: K-Means Clustering (with identical initialization)")
     print("="*80)
     
     device = 'cuda'
     torch.manual_seed(42)
     
     # 生成测试数据 - 标准 SVG 使用 [B*H, S, D] 格式
-    x = torch.randn(batch_size * num_heads, seq_len, dim, dtype=dtype, device=device)
+    BH = batch_size * num_heads
+    x = torch.randn(BH, seq_len, dim, dtype=dtype, device=device)
     
     print(f"Input shape: {x.shape}")
     print(f"Clusters: {num_clusters}, Max iters: {max_iters}")
     
-    # 标准 SVG K-Means
-    print("\n[SVG Standard] Running K-Means...")
+    # 生成固定的初始 centroids (两边共用)
+    torch.manual_seed(42)  # 确保可复现
+    init_indices = torch.randint(0, seq_len, (BH, num_clusters), device=device)
+    init_centroids = torch.gather(
+        x, dim=1, 
+        index=init_indices.unsqueeze(-1).expand(-1, -1, dim)
+    )  # [BH, K, D]
+    print(f"Initial centroids shape: {init_centroids.shape}")
+    
+    # 标准 SVG K-Means (使用相同初始化)
+    print("\n[SVG Standard] Running K-Means with shared init...")
     svg_labels, svg_centroids, svg_sizes, svg_iters = svg_kmeans(
-        x, n_clusters=num_clusters, max_iters=max_iters
+        x, n_clusters=num_clusters, max_iters=max_iters, init_centroids=init_centroids.clone()
     )
     print(f"  Labels shape: {svg_labels.shape}")
     print(f"  Centroids shape: {svg_centroids.shape}")
     print(f"  Cluster sizes: min={svg_sizes.min().item()}, max={svg_sizes.max().item()}")
+    print(f"  Iterations: {svg_iters}")
     
-    # SGLang K-Means (你的实现)
-    print("\n[SGLang] Running K-Means...")
+    # SGLang K-Means (使用相同初始化)
+    print("\n[SGLang] Running K-Means with shared init...")
     sglang_labels, sglang_centroids, sglang_sizes = sglang_kmeans(
-        x, n_clusters=num_clusters, max_iters=max_iters
+        x, n_clusters=num_clusters, max_iters=max_iters, init_centroids=init_centroids.clone()
     )
     print(f"  Labels shape: {sglang_labels.shape}")
     print(f"  Centroids shape: {sglang_centroids.shape}")
     print(f"  Cluster sizes: min={sglang_sizes.min().item()}, max={sglang_sizes.max().item()}")
     
-    # 对比 - 注意：K-Means 结果可能不完全一致（随机初始化等），
-    # 但聚类质量应该相近
+    # 对比 - 使用相同初始化，结果应该非常接近
     print("\n[Comparison]")
+    
+    # 对比 labels
+    labels_match = (svg_labels == sglang_labels).float().mean().item() * 100
+    print(f"  Labels match: {labels_match:.2f}%")
+    
+    # 对比 centroids
+    compute_errors(sglang_centroids, svg_centroids, "Centroids")
+    
+    # 对比 cluster sizes
+    sizes_match = (svg_sizes == sglang_sizes).float().mean().item() * 100
+    print(f"  Cluster sizes match: {sizes_match:.2f}%")
     
     # 对比 cluster size 分布
     svg_sizes_sorted = svg_sizes.sort(dim=-1)[0].float()
     sglang_sizes_sorted = sglang_sizes.sort(dim=-1)[0].float()
     size_diff = (svg_sizes_sorted - sglang_sizes_sorted).abs().mean().item()
     print(f"  Cluster size distribution diff (sorted): {size_diff:.4f}")
-    
-    # 对比 centroids 的统计特性
-    svg_cent_norm = torch.norm(svg_centroids.float(), dim=-1).mean().item()
-    sglang_cent_norm = torch.norm(sglang_centroids.float(), dim=-1).mean().item()
-    print(f"  SVG centroid norm mean: {svg_cent_norm:.4f}")
-    print(f"  SGLang centroid norm mean: {sglang_cent_norm:.4f}")
     
     return svg_labels, sglang_labels, svg_centroids, sglang_centroids, svg_sizes, sglang_sizes
 
@@ -527,7 +542,7 @@ def test_block_sparse_attention(
 
 
 # ============================================================================
-# 测试 6: 完整 SVG2 流程 (不含 FlashInfer)
+# 测试 6: 完整 SVG2 流程 (使用相同的 K-Means 初始化)
 # ============================================================================
 def test_full_svg2_pipeline(
     batch_size=1,
@@ -540,9 +555,9 @@ def test_full_svg2_pipeline(
     kmeans_iters=10,
     dtype=torch.bfloat16,
 ):
-    """测试完整的 SVG2 流程，使用 PyTorch 参考版本做对比"""
+    """测试完整的 SVG2 流程，使用相同的 K-Means 初始化确保公平对比"""
     print("\n" + "="*80)
-    print("TEST 6: Full SVG2 Pipeline (with PyTorch reference)")
+    print("TEST 6: Full SVG2 Pipeline (with identical K-Means initialization)")
     print("="*80)
     
     device = 'cuda'
@@ -557,42 +572,69 @@ def test_full_svg2_pipeline(
     print(f"Clusters: Qc={num_q_clusters}, Kc={num_k_clusters}")
     print(f"top_p: {top_p}, kmeans_iters: {kmeans_iters}")
     
+    # 转换为 [B, H, S, D] 格式
+    q_bhsd = q.transpose(1, 2).contiguous()
+    k_bhsd = k.transpose(1, 2).contiguous()
+    v_bhsd = v.transpose(1, 2).contiguous()
+    
+    # 生成共享的初始 centroids
+    BH = batch_size * num_heads
+    q_flat = q_bhsd.reshape(BH, seq_len, head_dim)
+    k_flat = k_bhsd.reshape(BH, seq_len, head_dim)
+    
+    torch.manual_seed(42)  # 确保可复现
+    q_init_indices = torch.randint(0, seq_len, (BH, num_q_clusters), device=device)
+    k_init_indices = torch.randint(0, seq_len, (BH, num_k_clusters), device=device)
+    
+    q_init_centroids = torch.gather(
+        q_flat, dim=1, 
+        index=q_init_indices.unsqueeze(-1).expand(-1, -1, head_dim)
+    )  # [BH, Kq, D]
+    k_init_centroids = torch.gather(
+        k_flat, dim=1,
+        index=k_init_indices.unsqueeze(-1).expand(-1, -1, head_dim)
+    )  # [BH, Kk, D]
+    
+    print(f"Shared Q init centroids shape: {q_init_centroids.shape}")
+    print(f"Shared K init centroids shape: {k_init_centroids.shape}")
+    
     # Dense reference
     print("\n[Reference] Dense Attention...")
-    q_t = q.transpose(1, 2)
-    k_t = k.transpose(1, 2)
-    v_t = v.transpose(1, 2)
     with torch.no_grad():
-        dense_out = dense_attention(q_t, k_t, v_t)
+        dense_out = dense_attention(q_bhsd, k_bhsd, v_bhsd)
         dense_out = dense_out.transpose(1, 2)  # 回到 [B, S, H, D]
     print(f"  Output shape: {dense_out.shape}")
     
-    # SGLang SVG2
-    print("\n[SGLang] SVG2 Forward...")
+    # SGLang SVG2 (使用共享的初始化)
+    print("\n[SGLang] SVG2 Forward (with shared init)...")
+    # 转换 init_centroids 到 [B, H, K, D] 格式给 SGLang
+    q_init_bhkd = q_init_centroids.reshape(batch_size, num_heads, num_q_clusters, head_dim)
+    k_init_bhkd = k_init_centroids.reshape(batch_size, num_heads, num_k_clusters, head_dim)
+    
     with torch.no_grad():
-        sglang_out, _, _ = sglang_svg2_forward(
+        sglang_out, sglang_q_cent, sglang_k_cent = sglang_svg2_forward(
             q, k, v,
             num_q_clusters=num_q_clusters,
             num_k_clusters=num_k_clusters,
             top_p=top_p,
             kmeans_iters=kmeans_iters,
+            init_q_centroids=q_init_bhkd.clone(),
+            init_k_centroids=k_init_bhkd.clone(),
         )
     print(f"  Output shape: {sglang_out.shape}")
     
-    # 手动实现 SVG2 流程（用 SVG 组件 + PyTorch sparse attention）
-    print("\n[SVG Components + PyTorch Sparse Attn]...")
+    # SVG Components 流程 (使用相同的初始化)
+    print("\n[SVG Components + PyTorch Sparse Attn] (with shared init)...")
     with torch.no_grad():
-        # 转换为 [B, H, S, D]
-        q_bhsd = q.transpose(1, 2).contiguous()
-        k_bhsd = k.transpose(1, 2).contiguous()
-        v_bhsd = v.transpose(1, 2).contiguous()
-        
-        # K-Means
-        q_flat = q_bhsd.reshape(batch_size * num_heads, seq_len, head_dim)
-        k_flat = k_bhsd.reshape(batch_size * num_heads, seq_len, head_dim)
-        
-        q_labels, q_centroids, q_sizes, _ = svg_kmeans(q_flat, n_clusters=num_q_clusters, max_iters=kmeans_iters)
-        k_labels, k_centroids, k_sizes, _ = svg_kmeans(k_flat, n_clusters=num_k_clusters, max_iters=kmeans_iters)
+        # K-Means (使用共享初始化)
+        q_labels, q_centroids, q_sizes, _ = svg_kmeans(
+            q_flat, n_clusters=num_q_clusters, max_iters=kmeans_iters, 
+            init_centroids=q_init_centroids.clone()
+        )
+        k_labels, k_centroids, k_sizes, _ = svg_kmeans(
+            k_flat, n_clusters=num_k_clusters, max_iters=kmeans_iters,
+            init_centroids=k_init_centroids.clone()
+        )
         
         # Reshape
         q_centroids = q_centroids.reshape(batch_size, num_heads, num_q_clusters, head_dim)
@@ -617,18 +659,185 @@ def test_full_svg2_pipeline(
     
     print(f"  Output shape: {svg_ref_out.shape}")
     
-    # 对比
-    print("\n[Comparison]")
+    # 对比 K-Means 结果
+    print("\n[K-Means Comparison]")
+    compute_errors(sglang_q_cent, q_centroids, "Q Centroids")
+    compute_errors(sglang_k_cent, k_centroids, "K Centroids")
+    
+    # 对比最终结果
+    print("\n[Final Output Comparison]")
     print("SGLang SVG2 vs Dense:")
     compute_errors(sglang_out, dense_out, "SGLang vs Dense")
     
     print("\nSVG Reference vs Dense:")
     compute_errors(svg_ref_out, dense_out, "SVG Ref vs Dense")
     
-    print("\nSGLang vs SVG Reference (implementations should match):")
+    print("\nSGLang vs SVG Reference (should be very close now):")
     compute_errors(sglang_out, svg_ref_out, "SGLang vs SVG Ref")
     
     return dense_out, sglang_out, svg_ref_out
+
+
+# ============================================================================
+# 测试 7: 多 top_p 值对比测试
+# ============================================================================
+def test_multi_top_p(
+    batch_size=1,
+    seq_len=1024,
+    num_heads=4,
+    head_dim=64,
+    num_q_clusters=32,
+    num_k_clusters=32,
+    top_p_values=[0.3, 0.5, 0.7, 0.9],
+    kmeans_iters=10,
+    dtype=torch.bfloat16,
+):
+    """测试不同 top_p 值下 SGLang 和 SVG Reference 的对比"""
+    print("\n" + "="*80)
+    print("TEST 7: Multi Top-P Comparison (SGLang vs SVG Reference)")
+    print("="*80)
+    
+    device = 'cuda'
+    torch.manual_seed(42)
+    
+    # 生成测试数据
+    q = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device)
+    v = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device)
+    
+    # 转换格式
+    q_bhsd = q.transpose(1, 2).contiguous()
+    k_bhsd = k.transpose(1, 2).contiguous()
+    v_bhsd = v.transpose(1, 2).contiguous()
+    
+    # 生成共享的初始 centroids
+    BH = batch_size * num_heads
+    q_flat = q_bhsd.reshape(BH, seq_len, head_dim)
+    k_flat = k_bhsd.reshape(BH, seq_len, head_dim)
+    
+    torch.manual_seed(42)
+    q_init_indices = torch.randint(0, seq_len, (BH, num_q_clusters), device=device)
+    k_init_indices = torch.randint(0, seq_len, (BH, num_k_clusters), device=device)
+    
+    q_init_centroids = torch.gather(
+        q_flat, dim=1, 
+        index=q_init_indices.unsqueeze(-1).expand(-1, -1, head_dim)
+    )
+    k_init_centroids = torch.gather(
+        k_flat, dim=1,
+        index=k_init_indices.unsqueeze(-1).expand(-1, -1, head_dim)
+    )
+    
+    # 先运行 K-Means 一次，两边使用相同结果
+    print("Running shared K-Means...")
+    with torch.no_grad():
+        # SVG K-Means
+        q_labels, q_centroids, q_sizes, _ = svg_kmeans(
+            q_flat, n_clusters=num_q_clusters, max_iters=kmeans_iters, 
+            init_centroids=q_init_centroids.clone()
+        )
+        k_labels, k_centroids, k_sizes, _ = svg_kmeans(
+            k_flat, n_clusters=num_k_clusters, max_iters=kmeans_iters,
+            init_centroids=k_init_centroids.clone()
+        )
+        
+        # SGLang K-Means (验证一致性)
+        sglang_q_labels, sglang_q_centroids, sglang_q_sizes = sglang_kmeans(
+            q_flat, n_clusters=num_q_clusters, max_iters=kmeans_iters, 
+            init_centroids=q_init_centroids.clone()
+        )
+        sglang_k_labels, sglang_k_centroids, sglang_k_sizes = sglang_kmeans(
+            k_flat, n_clusters=num_k_clusters, max_iters=kmeans_iters,
+            init_centroids=k_init_centroids.clone()
+        )
+    
+    # 检查 K-Means 结果一致性
+    q_labels_match = (q_labels == sglang_q_labels).float().mean().item() * 100
+    k_labels_match = (k_labels == sglang_k_labels).float().mean().item() * 100
+    print(f"  Q labels match: {q_labels_match:.2f}%")
+    print(f"  K labels match: {k_labels_match:.2f}%")
+    
+    # Reshape centroids
+    q_centroids_bhkd = q_centroids.reshape(batch_size, num_heads, num_q_clusters, head_dim)
+    k_centroids_bhkd = k_centroids.reshape(batch_size, num_heads, num_k_clusters, head_dim)
+    q_sizes_bh = q_sizes.reshape(batch_size, num_heads, num_q_clusters)
+    k_sizes_bh = k_sizes.reshape(batch_size, num_heads, num_k_clusters)
+    
+    sglang_q_centroids_bhkd = sglang_q_centroids.reshape(batch_size, num_heads, num_q_clusters, head_dim)
+    sglang_k_centroids_bhkd = sglang_k_centroids.reshape(batch_size, num_heads, num_k_clusters, head_dim)
+    sglang_q_sizes_bh = sglang_q_sizes.reshape(batch_size, num_heads, num_q_clusters)
+    sglang_k_sizes_bh = sglang_k_sizes.reshape(batch_size, num_heads, num_k_clusters)
+    
+    # Permutation (共用一次)
+    with torch.no_grad():
+        # PyTorch 参考 permute
+        q_perm_ref, q_idx = pytorch_ref_permute(q_bhsd, q_labels, dim=2)
+        k_perm_ref, k_idx = pytorch_ref_permute(k_bhsd, k_labels, dim=2)
+        v_perm_ref, _ = pytorch_ref_permute(v_bhsd, k_labels, dim=2, sorted_indices=k_idx)
+        
+        # SGLang Triton permute
+        q_perm_sg, _ = sglang_permute(q_bhsd, labels=sglang_q_labels)
+        k_perm_sg, sglang_k_idx = sglang_permute(k_bhsd, labels=sglang_k_labels)
+        v_perm_sg, _ = sglang_permute(v_bhsd, sorted_indices=sglang_k_idx)
+    
+    # Dense reference
+    with torch.no_grad():
+        dense_out = dense_attention(q_bhsd, k_bhsd, v_bhsd)
+    
+    print(f"\nInput: B={batch_size}, H={num_heads}, S={seq_len}, D={head_dim}")
+    print(f"Clusters: Qc={num_q_clusters}, Kc={num_k_clusters}")
+    print("-" * 80)
+    print(f"{'top_p':>6} | {'Active%':>8} | {'SGLang vs SVG':>20} | {'vs Dense':>15}")
+    print(f"{'':>6} | {'':>8} | {'Cosine':>10} {'MaxAbs':>9} | {'Cosine':>15}")
+    print("-" * 80)
+    
+    for top_p in top_p_values:
+        with torch.no_grad():
+            # 生成 block mask (两边使用相同的 centroids)
+            svg_mask = svg_identify_map(q_centroids_bhkd, k_centroids_bhkd, q_sizes_bh, k_sizes_bh, p=top_p)
+            sglang_mask = sglang_identify_mask(
+                sglang_q_centroids_bhkd, sglang_k_centroids_bhkd, 
+                sglang_q_sizes_bh, sglang_k_sizes_bh, 
+                top_p=top_p
+            )
+            
+            active_pct = svg_mask.float().mean().item() * 100
+            
+            # SVG block sparse attention
+            svg_out_perm = svg_block_sparse_torch(
+                q_perm_ref, k_perm_ref, v_perm_ref, 
+                svg_mask, q_sizes_bh, k_sizes_bh
+            )
+            svg_out = pytorch_ref_inverse_permute(svg_out_perm, q_idx, dim=2)
+            
+            # SGLang block sparse attention
+            sglang_out_perm = sglang_block_sparse_attn(
+                q_perm_sg, k_perm_sg, v_perm_sg,
+                sglang_mask, sglang_q_sizes_bh, sglang_k_sizes_bh
+            )
+            sglang_out = sglang_inverse_permute(sglang_out_perm, sglang_k_idx)
+            # 注意：SGLang inverse permute 需要使用 q 的 sorted_indices
+            # 重新计算
+            _, q_sorted_idx = sglang_permute(q_bhsd, labels=sglang_q_labels)
+            sglang_out = sglang_inverse_permute(sglang_out_perm, q_sorted_idx)
+            
+            # 计算误差
+            sglang_f = sglang_out.float()
+            svg_f = svg_out.float()
+            dense_f = dense_out.float()
+            
+            # SGLang vs SVG
+            cos_sim = F.cosine_similarity(sglang_f.flatten(), svg_f.flatten(), dim=0).item()
+            max_abs = (sglang_f - svg_f).abs().max().item()
+            
+            # vs Dense
+            cos_dense = F.cosine_similarity(sglang_f.flatten(), dense_f.flatten(), dim=0).item()
+            
+            print(f"{top_p:>6.1f} | {active_pct:>7.2f}% | {cos_sim:>10.6f} {max_abs:>9.6f} | {cos_dense:>15.6f}")
+    
+    print("-" * 80)
+    print("Note: 'SGLang vs SVG' should be very close (Cosine ≈ 1.0) for all top_p values")
+    print("      'vs Dense' will vary based on sparsity level")
 
 
 # ============================================================================
@@ -755,6 +964,25 @@ def main():
     except Exception as e:
         print(f"ERROR in test_full_svg2_pipeline: {e}")
         results['full_pipeline'] = f'FAIL: {e}'
+        import traceback
+        traceback.print_exc()
+    
+    # 测试 7: Multi Top-P Comparison
+    try:
+        test_multi_top_p(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_heads=num_heads,
+            head_dim=dim,
+            num_q_clusters=num_q_clusters,
+            num_k_clusters=num_k_clusters,
+            top_p_values=[0.3, 0.5, 0.7, 0.9],
+            dtype=dtype,
+        )
+        results['multi_top_p'] = 'PASS'
+    except Exception as e:
+        print(f"ERROR in test_multi_top_p: {e}")
+        results['multi_top_p'] = f'FAIL: {e}'
         import traceback
         traceback.print_exc()
     
