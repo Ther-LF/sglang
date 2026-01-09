@@ -1137,7 +1137,9 @@ def svg2_attention_forward(
     max_k_clusters_per_q: Optional[int] = None,
     init_q_centroids: Optional[torch.Tensor] = None,
     init_k_centroids: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    enable_profiling: bool = False,
+    layer_idx: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[dict]]:
     """
     Complete SVG2 (Semantic-Aware Permutation) attention forward pass.
 
@@ -1150,15 +1152,22 @@ def svg2_attention_forward(
         max_k_clusters_per_q: Optional cap of kept key clusters per query cluster
         init_q_centroids: Initial centroids for Query K-Means
         init_k_centroids: Initial centroids for Key K-Means
+        enable_profiling: Whether to collect timing statistics
+        layer_idx: Layer index for logging
     
     Returns:
         output: Attention output [B, S, H, D]
         final_q_centroids: Updated Query centroids [B, H, Kq, D]
         final_k_centroids: Updated Key centroids [B, H, Kk, D]
+        profile_stats: Optional dict with timing statistics
     """
+    import time
+    
     B, S, H, D = q.shape
     device = q.device
     dtype = q.dtype
+    
+    profile_stats = {} if enable_profiling else None
     
     # Transpose to [B, H, S, D] for easier processing
     q = q.transpose(1, 2).contiguous()
@@ -1182,12 +1191,21 @@ def svg2_attention_forward(
         k_init = init_k_centroids.reshape(B * H, num_k_clusters, D)
     
     # Step 1: K-Means clustering
+    if enable_profiling:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+    
     q_labels, q_centroids, q_cluster_sizes = triton_kmeans(
         q_flat, num_q_clusters, max_iters=kmeans_iters, init_centroids=q_init
     )
     k_labels, k_centroids, k_cluster_sizes = triton_kmeans(
         k_flat, num_k_clusters, max_iters=kmeans_iters, init_centroids=k_init
     )
+    
+    if enable_profiling:
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        profile_stats['kmeans_ms'] = (t1 - t0) * 1000
     
     # Reshape back
     q_labels = q_labels.reshape(B * H, S)
@@ -1199,6 +1217,10 @@ def svg2_attention_forward(
     k_cluster_sizes = k_cluster_sizes.reshape(B, H, num_k_clusters)
     
     # Step 2: Generate dynamic block mask
+    if enable_profiling:
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+    
     block_mask = identify_dynamic_mask(
         q_centroids, k_centroids,
         q_cluster_sizes, k_cluster_sizes,
@@ -1206,31 +1228,72 @@ def svg2_attention_forward(
         max_k_clusters_per_q=max_k_clusters_per_q,
     )
     
-    # DEBUG: Print block mask statistics (debug level to reduce spam)
+    if enable_profiling:
+        torch.cuda.synchronize()
+        t3 = time.perf_counter()
+        profile_stats['mask_gen_ms'] = (t3 - t2) * 1000
+    
+    # Compute block mask statistics
     total_blocks = block_mask.numel()
     active_blocks = block_mask.sum().item()
-    sparsity = 1.0 - (active_blocks / total_blocks)
-    logger.debug(f"[SVG2] Block Mask: {active_blocks}/{total_blocks} active ({100*(1-sparsity):.1f}%), sparsity={sparsity*100:.1f}%")
+    block_retention_ratio = active_blocks / total_blocks
+    sparsity = 1.0 - block_retention_ratio
+    
+    if enable_profiling:
+        profile_stats['total_blocks'] = total_blocks
+        profile_stats['active_blocks'] = active_blocks
+        profile_stats['block_retention_pct'] = block_retention_ratio * 100
+        profile_stats['sparsity_pct'] = sparsity * 100
+    
+    logger.debug(f"[SVG2] Block Mask: {active_blocks}/{total_blocks} active ({100*block_retention_ratio:.1f}%), sparsity={sparsity*100:.1f}%")
     
     # Step 3: Permute Q, K, V by cluster labels
+    if enable_profiling:
+        torch.cuda.synchronize()
+        t4 = time.perf_counter()
+    
     q_perm, q_sorted_indices = permute_by_labels(q, labels=q_labels)
     k_perm, k_sorted_indices = permute_by_labels(k, labels=k_labels)
     v_perm, _ = permute_by_labels(v, sorted_indices=k_sorted_indices)
     
+    if enable_profiling:
+        torch.cuda.synchronize()
+        t5 = time.perf_counter()
+        profile_stats['permute_ms'] = (t5 - t4) * 1000
+    
     # Step 4: Block sparse attention
+    if enable_profiling:
+        torch.cuda.synchronize()
+        t6 = time.perf_counter()
+    
     out_perm = block_sparse_attention(
         q_perm, k_perm, v_perm,
         block_mask,
         q_cluster_sizes, k_cluster_sizes,
     )
     
+    if enable_profiling:
+        torch.cuda.synchronize()
+        t7 = time.perf_counter()
+        profile_stats['sparse_attn_ms'] = (t7 - t6) * 1000
+    
     # Step 5: Inverse permutation
+    if enable_profiling:
+        torch.cuda.synchronize()
+        t8 = time.perf_counter()
+    
     output = inverse_permute(out_perm, q_sorted_indices)
+    
+    if enable_profiling:
+        torch.cuda.synchronize()
+        t9 = time.perf_counter()
+        profile_stats['inv_permute_ms'] = (t9 - t8) * 1000
+        profile_stats['total_ms'] = (t9 - t0) * 1000
     
     # Transpose back to [B, S, H, D]
     output = output.transpose(1, 2).contiguous()
     
-    return output, q_centroids, k_centroids
+    return output, q_centroids, k_centroids, profile_stats
 
 
 # ============================================================================
@@ -1460,12 +1523,10 @@ class SVG2SparseAttentionImpl(AttentionImpl):
                 current_kmeans_iters = 1
                 centroid_reuse = True
         
-        # Debug logging (only for layer 0)
-        if self.layer_idx == 0:
-            logger.debug(f"[SVG2] Sparse Attn: Qc={num_q_clusters}, Kc={num_k_clusters}, top_p={top_p}, "
-                        f"centroid_reuse={centroid_reuse}, kmeans_iters={current_kmeans_iters}")
+        # Enable profiling only for layer 0 to reduce logging overhead
+        enable_profiling = (self.layer_idx == 0)
         
-        output, new_q_centroids, new_k_centroids = svg2_attention_forward(
+        output, new_q_centroids, new_k_centroids, profile_stats = svg2_attention_forward(
             query, key, value,
             num_q_clusters=num_q_clusters,
             num_k_clusters=num_k_clusters,
@@ -1474,7 +1535,30 @@ class SVG2SparseAttentionImpl(AttentionImpl):
             max_k_clusters_per_q=max_k_clusters_per_q,
             init_q_centroids=init_q,
             init_k_centroids=init_k,
+            enable_profiling=enable_profiling,
+            layer_idx=self.layer_idx,
         )
+        
+        # Log profiling stats for layer 0
+        if enable_profiling and profile_stats is not None:
+            B, S, H, D = query.shape
+            logger.info(
+                f"[SVG2 Profile] Layer {self.layer_idx} | "
+                f"Shape: B={B},S={S},H={H},D={D} | "
+                f"Qc={num_q_clusters},Kc={num_k_clusters},top_p={top_p} | "
+                f"Blocks: {profile_stats.get('active_blocks', 0)}/{profile_stats.get('total_blocks', 0)} "
+                f"({profile_stats.get('block_retention_pct', 0):.1f}% kept) | "
+                f"centroid_reuse={centroid_reuse}"
+            )
+            logger.info(
+                f"[SVG2 Timing] "
+                f"KMeans: {profile_stats.get('kmeans_ms', 0):.1f}ms | "
+                f"MaskGen: {profile_stats.get('mask_gen_ms', 0):.1f}ms | "
+                f"Permute: {profile_stats.get('permute_ms', 0):.1f}ms | "
+                f"SparseAttn: {profile_stats.get('sparse_attn_ms', 0):.1f}ms | "
+                f"InvPermute: {profile_stats.get('inv_permute_ms', 0):.1f}ms | "
+                f"Total: {profile_stats.get('total_ms', 0):.1f}ms"
+            )
         
         # Update cache
         self.q_centroids = new_q_centroids

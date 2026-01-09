@@ -585,9 +585,27 @@ class USPAttention_SVG2(nn.Module):
         else:
             attn_impl = self.svg2_impl
         
+        # Profiling for layer 0 only (to avoid log spam)
+        enable_profiling = (self.layer_idx == 0)
+        
         if get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.
+            if enable_profiling and use_full_attn:
+                import time
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                
             out = attn_impl.forward(q, k, v, attn_metadata)
+            
+            if enable_profiling and use_full_attn:
+                torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                B, S, H, D = q.shape
+                self.logger.info(
+                    f"[FA Profile] Layer {self.layer_idx} | "
+                    f"Shape: B={B},S={S},H={H},D={D} | "
+                    f"FlashAttn Time: {(t1-t0)*1000:.1f}ms"
+                )
             return out
 
         # Ulysses-style All-to-All for sequence/head sharding
@@ -598,6 +616,11 @@ class USPAttention_SVG2(nn.Module):
             v = _usp_input_all_to_all(v, head_dim=2)
 
         # Ring Attention is not supported with SVG2, use local attention
+        if enable_profiling and use_full_attn:
+            import time
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            
         if get_ring_parallel_world_size() > 1:
             # For SVG2, we don't support ring attention yet
             # Fall back to local attention
@@ -605,6 +628,16 @@ class USPAttention_SVG2(nn.Module):
         else:
             # -> [B, S, H_local, D]
             out = attn_impl.forward(q, k, v, attn_metadata)
+        
+        if enable_profiling and use_full_attn:
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            B, S, H, D = q.shape
+            self.logger.info(
+                f"[FA Profile] Layer {self.layer_idx} | "
+                f"Shape: B={B},S={S},H={H},D={D} | "
+                f"FlashAttn Time: {(t1-t0)*1000:.1f}ms"
+            )
 
         # Ulysses-style All-to-All to restore original sharding
         if get_ulysses_parallel_world_size() > 1:
