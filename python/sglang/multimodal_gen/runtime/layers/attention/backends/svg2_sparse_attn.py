@@ -1390,8 +1390,8 @@ class SVG2SparseAttentionImpl(AttentionImpl):
             logger.info(f"SVG2 Sparse Attention Config:")
             logger.info(f"  num_q_clusters={num_q_clusters}, num_k_clusters={num_k_clusters}")
             logger.info(f"  top_p={top_p}, kmeans_iters={kmeans_iters}")
-            logger.info(f"  first_layers_fp={first_layers_fp} -> threshold={self.first_layers_threshold}/{total_layers} layers")
-            logger.info(f"  first_times_fp={first_times_fp} (first {first_times_fp*100:.0f}% of inference steps use full attention)")
+            logger.info(f"  first_layers_fp={first_layers_fp} -> first {self.first_layers_threshold}/{total_layers} layers use full attention")
+            logger.info(f"  first_times_fp={first_times_fp} -> first {first_times_fp*100:.0f}% of inference steps use full attention")
     
     def _extract_layer_idx(self, prefix: str) -> int:
         """Extract layer index from prefix string like 'blocks.5.attn1'."""
@@ -1400,36 +1400,6 @@ class SVG2SparseAttentionImpl(AttentionImpl):
         if match:
             return int(match.group(1))
         return 0
-    
-    def _should_use_full_attention(
-        self,
-        timestep_index: Optional[int] = None,
-        num_inference_steps: Optional[int] = None,
-    ) -> bool:
-        """
-        Determine if full attention should be used based on layer/timestep.
-        
-        Matching original SVG logic:
-        - if layer_idx < first_layers_threshold: use full attention
-        - if timestep_index < first_times_threshold: use full attention
-        
-        Note: timestep_index is the step index (0, 1, 2, ..., num_inference_steps-1).
-        first_times_fp=0.35 means the first 35% of steps use full attention.
-        So if timestep_index < 0.35 * num_inference_steps, use full attention.
-        """
-        # First N layers always use full attention
-        if self.layer_idx < self.first_layers_threshold:
-            return True
-        
-        # Early timesteps (low step indices) use full attention
-        # first_times_fp=0.35 means first 35% of steps use full attention
-        if timestep_index is not None and num_inference_steps is not None and num_inference_steps > 0:
-            # Calculate threshold based on actual num_inference_steps
-            first_times_threshold = int(self.first_times_fp * num_inference_steps)
-            if timestep_index < first_times_threshold:
-                return True
-        
-        return False
     
     def forward(
         self,
@@ -1449,6 +1419,10 @@ class SVG2SparseAttentionImpl(AttentionImpl):
         
         Returns:
             output: [B, S, H, D] attention output
+        
+        Note: The decision of when to use full attention vs sparse attention is now
+        handled by the model layer (USPAttention_SVG2), not here. This method always
+        performs SVG2 sparse attention.
         """
         # Get parameters from metadata or use defaults
         if attn_metadata is not None:
@@ -1457,63 +1431,14 @@ class SVG2SparseAttentionImpl(AttentionImpl):
             top_p = getattr(attn_metadata, 'top_p', self.top_p)
             kmeans_iters = getattr(attn_metadata, 'kmeans_iters', self.kmeans_iters)
             max_k_clusters_per_q = getattr(attn_metadata, 'max_k_clusters_per_q', self.max_k_clusters_per_q)
-            # Get timestep index and total steps for full attention decision
-            timestep_index = getattr(attn_metadata, 'current_timestep', None)
-            num_inference_steps = getattr(attn_metadata, 'num_inference_steps', 40)
         else:
             num_q_clusters = self.num_q_clusters
             num_k_clusters = self.num_k_clusters
             top_p = self.top_p
             kmeans_iters = self.kmeans_iters
             max_k_clusters_per_q = self.max_k_clusters_per_q
-            timestep_index = None
-            num_inference_steps = 40
-        
-        # Calculate actual threshold for logging
-        first_times_threshold = int(self.first_times_fp * num_inference_steps) if num_inference_steps > 0 else 0
-        
-        # Check if we should use full attention (early layers or early timesteps)
-        use_full_attn = self._should_use_full_attention(timestep_index, num_inference_steps)
-        
-        # Log attention mode (only for layer 0 and first/transition timesteps to reduce spam)
-        # Log when: first timestep, last full-attention timestep, first sparse timestep
-        should_log = (
-            self.layer_idx == 0 and (
-                timestep_index == 0 or  # First timestep
-                timestep_index == first_times_threshold - 1 or  # Last full-attention step
-                timestep_index == first_times_threshold or  # First sparse step
-                timestep_index == num_inference_steps - 1  # Last timestep
-            )
-        )
-        
-        if should_log:
-            attn_mode = "FULL (Dense)" if use_full_attn else "SPARSE (SVG2)"
-            logger.info(f"="*60)
-            logger.info(f"[SVG2] Step {timestep_index}/{num_inference_steps} | Layer {self.layer_idx} | Mode: {attn_mode}")
-            logger.info(f"  Input: shape={query.shape}, dtype={query.dtype}")
-            if use_full_attn:
-                reason = []
-                if self.layer_idx < self.first_layers_threshold:
-                    reason.append(f"layer {self.layer_idx} < first_layers_threshold {self.first_layers_threshold}")
-                if timestep_index is not None and timestep_index < first_times_threshold:
-                    reason.append(f"step {timestep_index} < first_times_threshold {first_times_threshold}")
-                logger.info(f"  Reason: {' AND '.join(reason) if reason else 'default'}")
-            else:
-                logger.info(f"  SVG2 Params: Qc={num_q_clusters}, Kc={num_k_clusters}, top_p={top_p}")
-                logger.info(f"  K-Means: iters={kmeans_iters}, max_k_per_q={max_k_clusters_per_q}")
-            logger.info(f"="*60)
-        
-        if use_full_attn:
-            # Use standard scaled dot-product attention
-            return self._full_attention(query, key, value)
-        
-        # Use SVG2 sparse attention
         
         # Determine if we can reuse centroids from previous steps
-        # If centroids are initialized and we are in a later timestep (or logic permits), reuse them
-        # Note: In reverse diffusion, timesteps decrease. 
-        # But we simply check if we have cached centroids.
-        
         # Default strategy: 
         # - If no cache: init mode (more iters)
         # - If cache: step mode (fewer iters, reuse centroids)
@@ -1535,10 +1460,10 @@ class SVG2SparseAttentionImpl(AttentionImpl):
                 current_kmeans_iters = 1
                 centroid_reuse = True
         
-        # Log centroid reuse status (only for layer 0 and key timesteps)
-        if should_log and not use_full_attn:
-            reuse_status = "REUSING cached" if centroid_reuse else "INITIALIZING new"
-            logger.info(f"  Centroids: {reuse_status} (kmeans_iters={current_kmeans_iters})")
+        # Debug logging (only for layer 0)
+        if self.layer_idx == 0:
+            logger.debug(f"[SVG2] Sparse Attn: Qc={num_q_clusters}, Kc={num_k_clusters}, top_p={top_p}, "
+                        f"centroid_reuse={centroid_reuse}, kmeans_iters={current_kmeans_iters}")
         
         output, new_q_centroids, new_k_centroids = svg2_attention_forward(
             query, key, value,
@@ -1557,29 +1482,6 @@ class SVG2SparseAttentionImpl(AttentionImpl):
         self.centroids_initialized = True
         
         return output
-    
-    def _full_attention(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-    ) -> torch.Tensor:
-        """Standard full attention using PyTorch SDPA."""
-        # Input shape: [B, S, H, D]
-        # SDPA expects: [B, H, S, D]
-        q = query.transpose(1, 2)
-        k = key.transpose(1, 2)
-        v = value.transpose(1, 2)
-        
-        output = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v,
-            dropout_p=0.0,
-            is_causal=self.causal,
-            scale=self.softmax_scale,
-        )
-        
-        # Transpose back to [B, S, H, D]
-        return output.transpose(1, 2)
 
 
 

@@ -399,6 +399,9 @@ class USPAttention_SVG2(nn.Module):
     
     This class combines USP communication patterns with SVG2's semantic-aware
     sparse attention for efficient video generation.
+    
+    Important: This layer handles the decision of when to use full attention vs
+    sparse attention, routing to the appropriate backend (FlashAttention vs SVG2).
     """
 
     def __init__(
@@ -431,12 +434,12 @@ class USPAttention_SVG2(nn.Module):
         if num_kv_heads is None:
             num_kv_heads = num_heads
 
-        # Force use SVG2 backend
+        # SVG2 backend for sparse attention
         from sglang.multimodal_gen.runtime.layers.attention.backends.svg2_sparse_attn import (
             SVG2SparseAttentionImpl,
         )
         
-        self.attn_impl = SVG2SparseAttentionImpl(
+        self.svg2_impl = SVG2SparseAttentionImpl(
             num_heads=num_heads,
             head_size=head_size,
             causal=causal,
@@ -454,6 +457,26 @@ class USPAttention_SVG2(nn.Module):
             **extra_impl_args,
         )
         
+        # FlashAttention backend for full attention (when early layers/timesteps need it)
+        # This gives us the optimized FlashAttention performance
+        fa_backend_cls = get_attn_backend(supported_attention_backends)
+        self.fa_impl = fa_backend_cls.get_impl_cls()(
+            num_heads=num_heads,
+            head_size=head_size,
+            causal=causal,
+            softmax_scale=self.softmax_scale,
+            num_kv_heads=num_kv_heads,
+            prefix=prefix,
+            **extra_impl_args,
+        )
+        
+        # Store parameters for decision making
+        self.first_layers_fp = first_layers_fp
+        self.first_times_fp = first_times_fp
+        self.total_layers = total_layers
+        self.first_layers_threshold = int(first_layers_fp * total_layers)
+        self.layer_idx = self.svg2_impl.layer_idx
+        
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -461,6 +484,34 @@ class USPAttention_SVG2(nn.Module):
         self.dtype = get_compute_dtype()
         self.causal = causal
         self.dropout_p = dropout_rate
+        
+        # Logging
+        from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+        self.logger = init_logger(__name__)
+
+    def _should_use_full_attention(
+        self,
+        timestep_index: int | None,
+        num_inference_steps: int | None,
+    ) -> bool:
+        """
+        Determine if full attention should be used based on layer/timestep.
+        
+        Logic:
+        - if layer_idx < first_layers_threshold: use full attention
+        - if timestep_index < first_times_threshold: use full attention
+        """
+        # First N layers always use full attention
+        if self.layer_idx < self.first_layers_threshold:
+            return True
+        
+        # Early timesteps use full attention
+        if timestep_index is not None and num_inference_steps is not None and num_inference_steps > 0:
+            first_times_threshold = int(self.first_times_fp * num_inference_steps)
+            if timestep_index < first_times_threshold:
+                return True
+        
+        return False
 
     def forward(
         self,
@@ -490,9 +541,48 @@ class USPAttention_SVG2(nn.Module):
             forward_context: ForwardContext = get_forward_context()
             attn_metadata = forward_context.attn_metadata
         
+        # Determine which backend to use
+        timestep_index = getattr(attn_metadata, 'current_timestep', None) if attn_metadata else None
+        num_inference_steps = getattr(attn_metadata, 'num_inference_steps', 40) if attn_metadata else 40
+        use_full_attn = self._should_use_full_attention(timestep_index, num_inference_steps)
+        
+        # Log at key timesteps (only layer 0 to reduce spam)
+        first_times_threshold = int(self.first_times_fp * num_inference_steps) if num_inference_steps > 0 else 0
+        should_log = (
+            self.layer_idx == 0 and timestep_index is not None and (
+                timestep_index == 0 or
+                timestep_index == first_times_threshold - 1 or
+                timestep_index == first_times_threshold or
+                timestep_index == num_inference_steps - 1
+            )
+        )
+        
+        if should_log:
+            attn_mode = "FULL (FlashAttention)" if use_full_attn else "SPARSE (SVG2)"
+            self.logger.info(f"="*60)
+            self.logger.info(f"[SVG2] Step {timestep_index}/{num_inference_steps} | Layer {self.layer_idx} | Mode: {attn_mode}")
+            self.logger.info(f"  Input: shape={q.shape}, dtype={q.dtype}")
+            if use_full_attn:
+                reason = []
+                if self.layer_idx < self.first_layers_threshold:
+                    reason.append(f"layer {self.layer_idx} < first_layers_threshold {self.first_layers_threshold}")
+                if timestep_index is not None and timestep_index < first_times_threshold:
+                    reason.append(f"step {timestep_index} < first_times_threshold {first_times_threshold}")
+                self.logger.info(f"  Reason: {' AND '.join(reason) if reason else 'default'}")
+            else:
+                svg2_impl = self.svg2_impl
+                self.logger.info(f"  SVG2 Params: Qc={svg2_impl.num_q_clusters}, Kc={svg2_impl.num_k_clusters}, top_p={svg2_impl.top_p}")
+            self.logger.info(f"="*60)
+        
+        # Choose the appropriate attention implementation
+        if use_full_attn:
+            attn_impl = self.fa_impl
+        else:
+            attn_impl = self.svg2_impl
+        
         if get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.
-            out = self.attn_impl.forward(q, k, v, attn_metadata)
+            out = attn_impl.forward(q, k, v, attn_metadata)
             return out
 
         # Ulysses-style All-to-All for sequence/head sharding
@@ -505,11 +595,11 @@ class USPAttention_SVG2(nn.Module):
         # Ring Attention is not supported with SVG2, use local attention
         if get_ring_parallel_world_size() > 1:
             # For SVG2, we don't support ring attention yet
-            # Fall back to local SVG2 attention
-            out = self.attn_impl.forward(q, k, v, attn_metadata)
+            # Fall back to local attention
+            out = attn_impl.forward(q, k, v, attn_metadata)
         else:
             # -> [B, S, H_local, D]
-            out = self.attn_impl.forward(q, k, v, attn_metadata)
+            out = attn_impl.forward(q, k, v, attn_metadata)
 
         # Ulysses-style All-to-All to restore original sharding
         if get_ulysses_parallel_world_size() > 1:
