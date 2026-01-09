@@ -32,20 +32,246 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 # ============================================================================
-# 尝试导入 SVG 的 K-Means 实现（如果可用）
-# ============================================================================
-_SVG_KMEANS_AVAILABLE = False
-try:
-    from svg.kmeans_utils import batch_kmeans_Euclid as svg_batch_kmeans_Euclid
-    _SVG_KMEANS_AVAILABLE = True
-    logger.info("Using SVG's batch_kmeans_Euclid for K-Means clustering")
-except ImportError:
-    logger.info("SVG K-Means not available, using built-in PyTorch implementation")
-
-# ============================================================================
-# Part 1: Triton Kernels for K-Means Clustering
+# Part 1: Triton Kernels for K-Means Clustering (ported from SVG)
 # ============================================================================
 
+# -----------------------------------------------------------------------------
+# Triton kernel: compute nearest-centroid IDs (Euclidean distance)
+# This is ported from SVG's kmeans_utils.py for exact numerical consistency
+# -----------------------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N": BN, "BLOCK_K": BK}, num_stages=4, num_warps=wp)
+        for BN in [32, 64, 128]
+        for BK in [32, 64, 128]
+        for wp in [4, 8]
+        if not (BN * BK < 32 * 32 and wp > 4)  # Prune unbalanced configs
+    ],
+    key=["N", "K"],
+)
+@triton.jit
+def _svg_euclid_assign_kernel(
+    x_ptr,       # [B, N, D]
+    c_ptr,       # [B, K, D]
+    x_sq_ptr,    # [B, N] - precomputed ||x||^2
+    out_ptr,     # [B, N] - output cluster IDs
+    B: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    D: tl.constexpr,
+    stride_x_b: tl.constexpr,
+    stride_x_n: tl.constexpr,
+    stride_x_d: tl.constexpr,
+    stride_c_b: tl.constexpr,
+    stride_c_k: tl.constexpr,
+    stride_c_d: tl.constexpr,
+    stride_xsq_b: tl.constexpr,
+    stride_xsq_n: tl.constexpr,
+    stride_out_b: tl.constexpr,
+    stride_out_n: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Each program handles a tile of BLOCK_N points for a given batch element.
+    Iterates over centroids in chunks of BLOCK_K and maintains running minimum.
+    """
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    n_start = pid_n * BLOCK_N
+    n_offsets = n_start + tl.arange(0, BLOCK_N)
+    n_mask = n_offsets < N
+
+    # Load x tile (BLOCK_N, D)
+    offs_d = tl.arange(0, D)
+    x_ptrs = x_ptr + pid_b * stride_x_b + n_offsets[:, None] * stride_x_n + offs_d[None, :] * stride_x_d
+    x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0)
+
+    # Pre-load x_sq for the tile (BLOCK_N,)
+    xsq_ptrs = x_sq_ptr + pid_b * stride_xsq_b + n_offsets * stride_xsq_n
+    x_sq_tile = tl.load(xsq_ptrs, mask=n_mask, other=0.0).to(tl.float32)
+
+    # Init best distance / index
+    best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)
+    best_idx = tl.zeros((BLOCK_N,), tl.int32)
+
+    # Iterate over centroids in chunks of BLOCK_K
+    for k_start in range(0, K, BLOCK_K):
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        k_mask = k_offsets < K
+
+        # Load centroid tile (D, BLOCK_K)
+        c_ptrs = c_ptr + pid_b * stride_c_b + k_offsets[None, :] * stride_c_k + offs_d[:, None] * stride_c_d
+        c_tile = tl.load(c_ptrs, mask=k_mask[None, :], other=0.0)
+
+        # Compute centroid squared norms (BLOCK_K,)
+        cent_sq = tl.sum(c_tile * c_tile, axis=0).to(tl.float32)
+
+        # Compute cross term (BLOCK_N, BLOCK_K) = x_tile @ c_tile
+        cross = tl.dot(x_tile, c_tile).to(tl.float32)
+
+        # Squared Euclidean distance
+        dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
+        dist = tl.maximum(dist, 0.0)
+
+        # Mask out invalid centroid columns
+        dist = tl.where(k_mask[None, :], dist, 3.4e38)
+
+        curr_min = tl.min(dist, axis=1)
+        curr_idx = tl.argmin(dist, axis=1)
+
+        update = curr_min < best_dist
+        best_dist = tl.where(update, curr_min, best_dist)
+        best_idx = tl.where(update, k_start + curr_idx, best_idx)
+
+    # Write results
+    out_ptrs = out_ptr + pid_b * stride_out_b + n_offsets * stride_out_n
+    tl.store(out_ptrs, best_idx, mask=n_mask)
+
+
+def _svg_euclid_assign(
+    x: torch.Tensor,
+    centroids: torch.Tensor,
+    x_sq: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Return nearest-centroid indices using Triton kernel.
+    Ported from SVG's euclid_assign_triton.
+    """
+    B, N, D = x.shape
+    K = centroids.shape[1]
+    
+    out = torch.empty((B, N), device=x.device, dtype=torch.int64)
+    
+    stride_x_b, stride_x_n, stride_x_d = x.stride()
+    stride_c_b, stride_c_k, stride_c_d = centroids.stride()
+    stride_xsq_b, stride_xsq_n = x_sq.stride()
+    stride_out_b, stride_out_n = out.stride()
+    
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
+    
+    _svg_euclid_assign_kernel[grid](
+        x, centroids, x_sq, out,
+        B, N, K, D,
+        stride_x_b, stride_x_n, stride_x_d,
+        stride_c_b, stride_c_k, stride_c_d,
+        stride_xsq_b, stride_xsq_n,
+        stride_out_b, stride_out_n,
+    )
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Triton kernel: chunk-wise centroid update (sorted IDs)
+# This is ported from SVG's _centroid_update_chunk_kernel
+# -----------------------------------------------------------------------------
+
+@triton.jit
+def _svg_centroid_update_chunk_kernel(
+    x_ptr,               # [B, N, D] - original features
+    sorted_idx_ptr,      # [B, N] - indices after sort
+    sorted_cluster_ptr,  # [B, N] - cluster ids in sorted order
+    sum_ptr,             # [B, K, D] - output sums
+    count_ptr,           # [B, K] - output counts
+    B: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Each program processes BLOCK_N consecutive, already-sorted tokens.
+    Accumulates local sum/count for each cluster run and performs atomic update.
+    """
+    pid_chunk = tl.program_id(axis=0)
+    pid_b = tl.program_id(axis=1)
+
+    b = pid_b
+    chunk_start = pid_chunk * BLOCK_N
+
+    if chunk_start >= N:
+        return
+
+    # Base pointers for this batch
+    idx_batch_base = sorted_idx_ptr + b * N
+    cid_batch_base = sorted_cluster_ptr + b * N
+    x_batch_base = x_ptr + b * N * D
+
+    # Helper aranges
+    offs_token = tl.arange(0, BLOCK_N)
+    offs_dim = tl.arange(0, D)
+
+    # Token index & validity mask
+    token_idx = chunk_start + offs_token
+    valid_tok = token_idx < N
+    first_token_idx = chunk_start
+    last_token_idx = tl.minimum(chunk_start + BLOCK_N, N) - 1
+
+    # Load cluster IDs
+    first_id = tl.load(cid_batch_base + first_token_idx)
+    last_id = tl.load(cid_batch_base + last_token_idx)
+    all_ids = tl.load(cid_batch_base + token_idx, mask=valid_tok, other=-1)
+
+    all_tokens_idxs = tl.load(idx_batch_base + token_idx, mask=valid_tok, other=-1)
+    load_mask = all_tokens_idxs[:, None] * D + offs_dim[None, :]
+
+    for cid in range(first_id, last_id + 1):
+        cluster_mask = all_ids == cid
+        cluster_size = tl.sum(cluster_mask.to(tl.int32))
+        if cluster_size != 0:
+            cluster_feats = tl.load(x_batch_base + load_mask, mask=cluster_mask[:, None], other=0.0)
+            cluster_feats = cluster_feats.to(tl.float32)
+            sum_feats = tl.sum(cluster_feats, axis=0)
+            dest_ptr = sum_ptr + (b * K + cid) * D + offs_dim
+            tl.atomic_add(dest_ptr, sum_feats)
+            tl.atomic_add(count_ptr + b * K + cid, cluster_size)
+
+
+def _svg_centroid_update_sorted(
+    x: torch.Tensor,
+    cluster_ids: torch.Tensor,
+    old_centroids: torch.Tensor,
+    BLOCK_N: int = 256,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fast centroid update for Euclidean K-Means.
+    Ported from SVG's triton_centroid_update_sorted_euclid.
+    """
+    B, N, D = x.shape
+    K = old_centroids.shape[1]
+    
+    # Batch-wise sort of cluster assignments
+    sorted_cluster_ids, sorted_idx = torch.sort(cluster_ids, dim=-1)
+    sorted_idx_int = sorted_idx.to(torch.int32)
+    
+    centroid_sums = torch.zeros((B, K, D), device=x.device, dtype=torch.float32)
+    centroid_cnts = torch.zeros((B, K), device=x.device, dtype=torch.int32)
+    
+    grid = (triton.cdiv(N, BLOCK_N), B)
+    _svg_centroid_update_chunk_kernel[grid](
+        x,
+        sorted_idx_int,
+        sorted_cluster_ids.to(torch.int32),
+        centroid_sums,
+        centroid_cnts,
+        B, N, D, K,
+        BLOCK_N=BLOCK_N,
+    )
+    
+    # Convert sums to means; replace empty clusters with old centroids
+    counts_f = centroid_cnts.to(torch.float32).unsqueeze(-1).clamp(min=1.0)
+    centroids = centroid_sums / counts_f
+    empty_mask = (centroid_cnts == 0).unsqueeze(-1)
+    centroids = torch.where(empty_mask, old_centroids.to(torch.float32), centroids)
+    
+    return centroids.to(x.dtype), centroid_cnts
+
+
+# -----------------------------------------------------------------------------
+# Legacy Triton kernels (kept for reference, but not used by triton_kmeans)
+# -----------------------------------------------------------------------------
 
 @triton.jit
 def _pairwise_distance_kernel(
@@ -194,7 +420,12 @@ def triton_kmeans(
     tol: float = 1e-4,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    K-Means clustering - uses SVG's implementation if available, otherwise falls back to PyTorch.
+    K-Means clustering using Triton kernels (ported from SVG's batch_kmeans_Euclid).
+    
+    This implementation uses the same Triton kernels as SVG for exact numerical
+    consistency:
+    1. _svg_euclid_assign_kernel: Distance computation + cluster assignment
+    2. _svg_centroid_update_chunk_kernel: Sorted centroid update
     
     Args:
         x: Input tensor [B, N, D] or [N, D]
@@ -220,70 +451,48 @@ def triton_kmeans(
     device = x.device
     dtype = x.dtype
     
-    # ========================================================================
-    # 如果 SVG 的 K-Means 可用，直接使用它（保证完全一致）
-    # ========================================================================
-    if _SVG_KMEANS_AVAILABLE:
-        labels, centroids, cluster_sizes, n_iters = svg_batch_kmeans_Euclid(
-            x, n_clusters=n_clusters, max_iters=max_iters, 
-            tol=tol, init_centroids=init_centroids
-        )
-        
-        # Convert to expected dtypes
-        labels = labels.to(torch.int32)
-        cluster_sizes = cluster_sizes.to(torch.int32)
-        
-        if not is_batched:
-            labels = labels.squeeze(0)
-            centroids = centroids.squeeze(0)
-            cluster_sizes = cluster_sizes.squeeze(0)
-        
-        return labels, centroids.to(dtype), cluster_sizes
-    
-    # ========================================================================
-    # Fallback: 使用 PyTorch 实现（当 SVG 不可用时）
-    # ========================================================================
     logger.debug(f"[SVG2 Debug] K-Means: N={N}, K={K}, iters={max_iters}, init={'reuse' if init_centroids is not None else 'random'}")
     
-    # Pre-compute squared L2 norm of all points
-    x_sq = (x.float() ** 2).sum(dim=-1)  # [B, N]
+    # Pre-compute squared L2 norm of all points (constant during iterations)
+    x_sq = (x ** 2).sum(dim=-1)  # [B, N]
     
-    # Initialize centroids
+    # Initialize centroids (matching SVG's initialization)
     if init_centroids is not None:
-        centroids = init_centroids.clone().float()
+        centroids = init_centroids.clone()
     else:
         indices = torch.randint(0, N, (B, K), device=device)
         centroids = torch.gather(
-            x.float(), dim=1, 
+            x, dim=1, 
             index=indices.unsqueeze(-1).expand(-1, -1, D)
-        )
+        )  # [B, K, D]
     
-    centroids = centroids.view(B, K, D).float()
+    centroids = centroids.view(B, K, D)
     
     for iteration in range(max_iters):
-        # Distance computation
-        cent_sq = (centroids ** 2).sum(dim=-1)
-        cross = torch.bmm(x.float(), centroids.transpose(1, 2))
-        dist_sq = x_sq.unsqueeze(-1) + cent_sq.unsqueeze(1) - 2.0 * cross
-        dist_sq = dist_sq.clamp(min=0.0)
+        # ============================================================
+        # Step 1: Cluster assignment using Triton kernel (matching SVG)
+        # ============================================================
+        labels = _svg_euclid_assign(x, centroids, x_sq)
         
-        # Cluster assignment
-        labels = dist_sq.argmin(dim=-1)
-        
-        # Centroid update
-        new_centroids, cluster_sizes = _update_centroids_pytorch(
-            x.float(), labels, K, centroids
+        # ============================================================
+        # Step 2: Centroid update using sorted Triton kernel (matching SVG)
+        # ============================================================
+        new_centroids, cluster_sizes = _svg_centroid_update_sorted(
+            x, labels, centroids
         )
         
-        # Convergence check
+        # ============================================================
+        # Step 3: Convergence check
+        # ============================================================
         center_shift = (new_centroids - centroids).norm(dim=-1).max()
         centroids = new_centroids
         
         if center_shift < tol:
             break
     
-    labels = labels.to(torch.int32)
-    cluster_sizes = cluster_sizes.to(torch.int32)
+    # Convert to expected dtypes
+    labels = labels.to(torch.int64)
+    cluster_sizes = cluster_sizes.to(torch.int64)
     
     if not is_batched:
         labels = labels.squeeze(0)
