@@ -124,7 +124,8 @@ run_inference_on_gpu() {
     fi
 
     # Run command on specific GPU, redirect output to log file
-    CUDA_VISIBLE_DEVICES=$gpu_id "${args[@]}" > "$log_file" 2>&1
+    # PYTHONUNBUFFERED=1 ensures logs are flushed immediately (not buffered)
+    PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=$gpu_id "${args[@]}" > "$log_file" 2>&1
     
     local status=$?
     if [ $status -eq 0 ]; then

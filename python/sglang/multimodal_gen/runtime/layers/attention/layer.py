@@ -551,10 +551,11 @@ class USPAttention_SVG2(nn.Module):
         num_inference_steps = getattr(attn_metadata, 'num_inference_steps', 40) if attn_metadata else 40
         use_full_attn = self._should_use_full_attention(timestep_index, num_inference_steps)
         
-        # Log at key timesteps (only layer 0 to reduce spam)
+        # Log at key timesteps (layer 0 and layer 1 to show both FULL-only and switching behavior)
         first_times_threshold = int(self.first_times_fp * num_inference_steps) if num_inference_steps > 0 else 0
+        # Layer 0: always FULL (first_layers_fp), Layer 1: switches from FULL to SPARSE at first_times_threshold
         should_log = (
-            self.layer_idx == 0 and timestep_index is not None and (
+            self.layer_idx in (0, 1) and timestep_index is not None and (
                 timestep_index == 0 or
                 timestep_index == first_times_threshold - 1 or
                 timestep_index == first_times_threshold or
