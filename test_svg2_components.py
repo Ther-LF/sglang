@@ -786,10 +786,10 @@ def test_multi_top_p(
     
     print(f"\nInput: B={batch_size}, H={num_heads}, S={seq_len}, D={head_dim}")
     print(f"Clusters: Qc={num_q_clusters}, Kc={num_k_clusters}")
-    print("-" * 80)
-    print(f"{'top_p':>6} | {'Active%':>8} | {'SGLang vs SVG':>20} | {'vs Dense':>15}")
-    print(f"{'':>6} | {'':>8} | {'Cosine':>10} {'MaxAbs':>9} | {'Cosine':>15}")
-    print("-" * 80)
+    print("-" * 100)
+    print(f"{'top_p':>6} | {'Active%':>8} | {'SGLang vs SVG':>20} | {'SGLang vs Dense':>15} | {'SVG vs Dense':>15}")
+    print(f"{'':>6} | {'':>8} | {'Cosine':>10} {'MaxAbs':>9} | {'Cosine':>15} | {'Cosine':>15}")
+    print("-" * 100)
     
     for top_p in top_p_values:
         with torch.no_grad():
@@ -830,14 +830,18 @@ def test_multi_top_p(
             cos_sim = F.cosine_similarity(sglang_f.flatten(), svg_f.flatten(), dim=0).item()
             max_abs = (sglang_f - svg_f).abs().max().item()
             
-            # vs Dense
-            cos_dense = F.cosine_similarity(sglang_f.flatten(), dense_f.flatten(), dim=0).item()
+            # SGLang vs Dense
+            cos_sglang_dense = F.cosine_similarity(sglang_f.flatten(), dense_f.flatten(), dim=0).item()
             
-            print(f"{top_p:>6.1f} | {active_pct:>7.2f}% | {cos_sim:>10.6f} {max_abs:>9.6f} | {cos_dense:>15.6f}")
+            # SVG vs Dense
+            cos_svg_dense = F.cosine_similarity(svg_f.flatten(), dense_f.flatten(), dim=0).item()
+            
+            print(f"{top_p:>6.1f} | {active_pct:>7.2f}% | {cos_sim:>10.6f} {max_abs:>9.6f} | {cos_sglang_dense:>15.6f} | {cos_svg_dense:>15.6f}")
     
-    print("-" * 80)
+    print("-" * 100)
     print("Note: 'SGLang vs SVG' should be very close (Cosine ≈ 1.0) for all top_p values")
-    print("      'vs Dense' will vary based on sparsity level")
+    print("      'SGLang vs Dense' and 'SVG vs Dense' should be nearly identical")
+    print("      Both will vary based on sparsity level (higher top_p = closer to dense)")
 
 
 # ============================================================================
