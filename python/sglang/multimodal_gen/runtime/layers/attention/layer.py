@@ -586,7 +586,7 @@ class USPAttention_SVG2(nn.Module):
             attn_impl = self.svg2_impl
         
         # Profiling for layer 0 only (to avoid log spam)
-        enable_profiling = (self.layer_idx == 0)
+        enable_profiling = (self.layer_idx == 0 or self.layer_idx == 1 or self.layer_idx == 2)
         
         if get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.
