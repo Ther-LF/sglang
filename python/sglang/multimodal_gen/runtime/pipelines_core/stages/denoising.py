@@ -1204,6 +1204,7 @@ class DenoisingStage(PipelineStage):
                 num_k_clusters=server_args.num_k_clusters,
                 top_p=server_args.top_p_kmeans,
                 kmeans_iters=server_args.kmeans_iter_step,
+                num_inference_steps=batch.num_inference_steps,
             )
         else:
             return None

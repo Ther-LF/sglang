@@ -451,7 +451,8 @@ def triton_kmeans(
     device = x.device
     dtype = x.dtype
     
-    logger.debug(f"[SVG2 Debug] K-Means: N={N}, K={K}, iters={max_iters}, init={'reuse' if init_centroids is not None else 'random'}")
+    # K-Means logging at debug level
+    # logger.debug(f"[SVG2] K-Means: N={N}, K={K}, iters={max_iters}, init={'reuse' if init_centroids is not None else 'random'}")
     
     # Pre-compute squared L2 norm of all points (constant during iterations)
     x_sq = (x ** 2).sum(dim=-1)  # [B, N]
@@ -708,13 +709,11 @@ def identify_dynamic_mask(
         
     sorted_clusters_to_keep = ~remove_indices
     
-    # DEBUG: Print top-p selection stats
+    # DEBUG: Print top-p selection stats (debug level to reduce spam)
     kept_per_q = sorted_clusters_to_keep.sum(dim=-1).float()
-    logger.info(f"[SVG2 Debug] Top-P Selection (p={top_p}, min_kc_ratio={min_kc_ratio}):")
-    logger.info(f"  Total K clusters: {Kk}")
-    logger.info(f"  Preserve length (min_kc_ratio): {preserve_length}")
-    logger.info(f"  Kept K per Q: min={kept_per_q.min().item():.0f}, max={kept_per_q.max().item():.0f}, mean={kept_per_q.mean().item():.1f}")
-    logger.info(f"  Avg selection ratio: {kept_per_q.mean().item()/Kk*100:.2f}%")
+    logger.debug(f"[SVG2] Top-P Selection (p={top_p}, min_kc_ratio={min_kc_ratio}):")
+    logger.debug(f"  Kept K per Q: min={kept_per_q.min().item():.0f}, max={kept_per_q.max().item():.0f}, mean={kept_per_q.mean().item():.1f}")
+    logger.debug(f"  Avg selection ratio: {kept_per_q.mean().item()/Kk*100:.2f}%")
     
     # 9. Map back to original indices
     block_mask = torch.zeros((B, H, Kq, Kk), device=device, dtype=torch.bool)
@@ -1077,16 +1076,12 @@ def block_sparse_attention(
     
     out = torch.empty_like(q)
     
-    # DEBUG: Print sparse attention stats
+    # DEBUG: Print sparse attention stats (debug level to reduce spam)
     total_q_tokens = B * H * S
     total_kv_work = total_active_k_tokens
     dense_kv_work = B * H * QC * S  # If all blocks were active
     sparsity_ratio = 1.0 - (total_kv_work / dense_kv_work) if dense_kv_work > 0 else 0.0
-    logger.info(f"[SVG2 Debug] Sparse Attention Compute:")
-    logger.info(f"  Total Q tiles: {total_q_tiles}")
-    logger.info(f"  Active K tokens: {total_active_k_tokens}/{dense_kv_work} ({100*(1-sparsity_ratio):.2f}%)")
-    logger.info(f"  Compute sparsity: {sparsity_ratio*100:.2f}%")
-    logger.info(f"  Split-K factor: {split_k}")
+    logger.debug(f"[SVG2] Sparse Attn: Q_tiles={total_q_tiles}, Active_K={total_active_k_tokens}/{dense_kv_work} ({100*(1-sparsity_ratio):.1f}%), sparsity={sparsity_ratio*100:.1f}%")
     
     # === RUNNING PHASE 1: COMPUTE ===
     # Grid: One thread block per Split per Task
@@ -1211,16 +1206,11 @@ def svg2_attention_forward(
         max_k_clusters_per_q=max_k_clusters_per_q,
     )
     
-    # DEBUG: Print block mask statistics
+    # DEBUG: Print block mask statistics (debug level to reduce spam)
     total_blocks = block_mask.numel()
     active_blocks = block_mask.sum().item()
     sparsity = 1.0 - (active_blocks / total_blocks)
-    logger.info(f"[SVG2 Debug] Block Mask Stats:")
-    logger.info(f"  Block shape: {block_mask.shape} [B, H, Kq, Kk]")
-    logger.info(f"  Active blocks: {active_blocks}/{total_blocks} ({100*(1-sparsity):.2f}%)")
-    logger.info(f"  Sparsity: {sparsity*100:.2f}%")
-    logger.info(f"  Q cluster sizes: min={q_cluster_sizes.min().item()}, max={q_cluster_sizes.max().item()}, mean={q_cluster_sizes.float().mean().item():.1f}")
-    logger.info(f"  K cluster sizes: min={k_cluster_sizes.min().item()}, max={k_cluster_sizes.max().item()}, mean={k_cluster_sizes.float().mean().item():.1f}")
+    logger.debug(f"[SVG2] Block Mask: {active_blocks}/{total_blocks} active ({100*(1-sparsity):.1f}%), sparsity={sparsity*100:.1f}%")
     
     # Step 3: Permute Q, K, V by cluster labels
     q_perm, q_sorted_indices = permute_by_labels(q, labels=q_labels)
@@ -1251,7 +1241,7 @@ def svg2_attention_forward(
 @dataclass
 class SVG2SparseAttentionMetadata(AttentionMetadata):
     """Metadata for SVG2 sparse attention."""
-    current_timestep: int
+    current_timestep: int  # Step index (0, 1, 2, ..., num_inference_steps-1)
     num_frames: int
     num_tokens_per_frame: int
     num_q_clusters: int = 64
@@ -1264,6 +1254,8 @@ class SVG2SparseAttentionMetadata(AttentionMetadata):
     # Cache for centroids (for iterative refinement)
     q_centroids_cache: Optional[torch.Tensor] = None
     k_centroids_cache: Optional[torch.Tensor] = None
+    # Total number of inference steps (needed for first_times_fp calculation)
+    num_inference_steps: int = 40
 
 
 class SVG2SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
@@ -1284,6 +1276,7 @@ class SVG2SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         num_k_clusters: int = 64,
         top_p: float = 0.5,
         kmeans_iters: int = 5,
+        num_inference_steps: int = 40,
         **kwargs: dict[str, Any],
     ) -> SVG2SparseAttentionMetadata:
         max_k_clusters_per_q = kwargs.get("max_k_clusters_per_q", None)
@@ -1296,6 +1289,7 @@ class SVG2SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             top_p=top_p,
             kmeans_iters=kmeans_iters,
             max_k_clusters_per_q=max_k_clusters_per_q,
+            num_inference_steps=num_inference_steps,
         )
 
 
@@ -1379,11 +1373,9 @@ class SVG2SparseAttentionImpl(AttentionImpl):
         
         # first_layers_threshold: layers 0 to threshold-1 use full attention
         self.first_layers_threshold = int(first_layers_fp * total_layers)
-        # first_times_threshold: timesteps > threshold use full attention
-        # Diffusion timesteps decrease from total_timesteps to 0
-        # first_times_fp=0.35 means first 35% of timesteps (high values) use full attention
-        # So threshold = total_timesteps * (1 - first_times_fp)
-        self.first_times_threshold = int((1.0 - first_times_fp) * total_timesteps)
+        # first_times_fp: fraction of initial steps using full attention
+        # first_times_fp=0.35 means first 35% of steps (low indices) use full attention
+        # Threshold is calculated dynamically in forward() based on actual num_inference_steps
         
         # Centroid cache for iterative refinement across timesteps
         self.q_centroids = None
@@ -1399,7 +1391,7 @@ class SVG2SparseAttentionImpl(AttentionImpl):
             logger.info(f"  num_q_clusters={num_q_clusters}, num_k_clusters={num_k_clusters}")
             logger.info(f"  top_p={top_p}, kmeans_iters={kmeans_iters}")
             logger.info(f"  first_layers_fp={first_layers_fp} -> threshold={self.first_layers_threshold}/{total_layers} layers")
-            logger.info(f"  first_times_fp={first_times_fp} -> timestep_threshold={self.first_times_threshold}/{total_timesteps}")
+            logger.info(f"  first_times_fp={first_times_fp} (first {first_times_fp*100:.0f}% of inference steps use full attention)")
     
     def _extract_layer_idx(self, prefix: str) -> int:
         """Extract layer index from prefix string like 'blocks.5.attn1'."""
@@ -1411,26 +1403,31 @@ class SVG2SparseAttentionImpl(AttentionImpl):
     
     def _should_use_full_attention(
         self,
-        timestep: Optional[float] = None,
+        timestep_index: Optional[int] = None,
+        num_inference_steps: Optional[int] = None,
     ) -> bool:
         """
         Determine if full attention should be used based on layer/timestep.
         
         Matching original SVG logic:
         - if layer_idx < first_layers_threshold: use full attention
-        - if timestep > first_times_threshold: use full attention
+        - if timestep_index < first_times_threshold: use full attention
         
-        Note: timestep decreases from total_timesteps to 0 during inference,
-        so timestep > threshold means early inference steps (warm-up phase).
+        Note: timestep_index is the step index (0, 1, 2, ..., num_inference_steps-1).
+        first_times_fp=0.35 means the first 35% of steps use full attention.
+        So if timestep_index < 0.35 * num_inference_steps, use full attention.
         """
         # First N layers always use full attention
         if self.layer_idx < self.first_layers_threshold:
             return True
         
-        # Early timesteps (high values) use full attention
-        # timestep > threshold means we're in the early warm-up phase
-        if timestep is not None and timestep > self.first_times_threshold:
-            return True
+        # Early timesteps (low step indices) use full attention
+        # first_times_fp=0.35 means first 35% of steps use full attention
+        if timestep_index is not None and num_inference_steps is not None and num_inference_steps > 0:
+            # Calculate threshold based on actual num_inference_steps
+            first_times_threshold = int(self.first_times_fp * num_inference_steps)
+            if timestep_index < first_times_threshold:
+                return True
         
         return False
     
@@ -1460,30 +1457,51 @@ class SVG2SparseAttentionImpl(AttentionImpl):
             top_p = getattr(attn_metadata, 'top_p', self.top_p)
             kmeans_iters = getattr(attn_metadata, 'kmeans_iters', self.kmeans_iters)
             max_k_clusters_per_q = getattr(attn_metadata, 'max_k_clusters_per_q', self.max_k_clusters_per_q)
-            # Get timestep for full attention decision
-            timestep = getattr(attn_metadata, 'current_timestep', None)
+            # Get timestep index and total steps for full attention decision
+            timestep_index = getattr(attn_metadata, 'current_timestep', None)
+            num_inference_steps = getattr(attn_metadata, 'num_inference_steps', 40)
         else:
             num_q_clusters = self.num_q_clusters
             num_k_clusters = self.num_k_clusters
             top_p = self.top_p
             kmeans_iters = self.kmeans_iters
             max_k_clusters_per_q = self.max_k_clusters_per_q
-            timestep = None
+            timestep_index = None
+            num_inference_steps = 40
         
-        # DEBUG: Print actual parameters being used (only for layer 0 to avoid spam)
-        if self.layer_idx == 0:
-            logger.info(f"[SVG2 Debug Layer {self.layer_idx}] Forward call:")
-            logger.info(f"  Query shape: {query.shape}, dtype: {query.dtype}")
-            logger.info(f"  num_q_clusters={num_q_clusters}, num_k_clusters={num_k_clusters}")
-            logger.info(f"  top_p={top_p}, kmeans_iters={kmeans_iters}")
-            logger.info(f"  max_k_clusters_per_q={max_k_clusters_per_q}")
-            logger.info(f"  timestep={timestep}, first_times_threshold={self.first_times_threshold}")
-            logger.info(f"  first_layers_threshold={self.first_layers_threshold}")
+        # Calculate actual threshold for logging
+        first_times_threshold = int(self.first_times_fp * num_inference_steps) if num_inference_steps > 0 else 0
         
         # Check if we should use full attention (early layers or early timesteps)
-        use_full_attn = self._should_use_full_attention(timestep)
-        if self.layer_idx == 0:
-            logger.info(f"  use_full_attention={use_full_attn}")
+        use_full_attn = self._should_use_full_attention(timestep_index, num_inference_steps)
+        
+        # Log attention mode (only for layer 0 and first/transition timesteps to reduce spam)
+        # Log when: first timestep, last full-attention timestep, first sparse timestep
+        should_log = (
+            self.layer_idx == 0 and (
+                timestep_index == 0 or  # First timestep
+                timestep_index == first_times_threshold - 1 or  # Last full-attention step
+                timestep_index == first_times_threshold or  # First sparse step
+                timestep_index == num_inference_steps - 1  # Last timestep
+            )
+        )
+        
+        if should_log:
+            attn_mode = "FULL (Dense)" if use_full_attn else "SPARSE (SVG2)"
+            logger.info(f"="*60)
+            logger.info(f"[SVG2] Step {timestep_index}/{num_inference_steps} | Layer {self.layer_idx} | Mode: {attn_mode}")
+            logger.info(f"  Input: shape={query.shape}, dtype={query.dtype}")
+            if use_full_attn:
+                reason = []
+                if self.layer_idx < self.first_layers_threshold:
+                    reason.append(f"layer {self.layer_idx} < first_layers_threshold {self.first_layers_threshold}")
+                if timestep_index is not None and timestep_index < first_times_threshold:
+                    reason.append(f"step {timestep_index} < first_times_threshold {first_times_threshold}")
+                logger.info(f"  Reason: {' AND '.join(reason) if reason else 'default'}")
+            else:
+                logger.info(f"  SVG2 Params: Qc={num_q_clusters}, Kc={num_k_clusters}, top_p={top_p}")
+                logger.info(f"  K-Means: iters={kmeans_iters}, max_k_per_q={max_k_clusters_per_q}")
+            logger.info(f"="*60)
         
         if use_full_attn:
             # Use standard scaled dot-product attention
@@ -1517,8 +1535,10 @@ class SVG2SparseAttentionImpl(AttentionImpl):
                 current_kmeans_iters = 1
                 centroid_reuse = True
         
-        if self.layer_idx == 0:
-            logger.info(f"  centroid_reuse={centroid_reuse}, kmeans_iters={current_kmeans_iters} (config={kmeans_iters})")
+        # Log centroid reuse status (only for layer 0 and key timesteps)
+        if should_log and not use_full_attn:
+            reuse_status = "REUSING cached" if centroid_reuse else "INITIALIZING new"
+            logger.info(f"  Centroids: {reuse_status} (kmeans_iters={current_kmeans_iters})")
         
         output, new_q_centroids, new_k_centroids = svg2_attention_forward(
             query, key, value,
