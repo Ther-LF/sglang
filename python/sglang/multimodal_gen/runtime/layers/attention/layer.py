@@ -459,13 +459,12 @@ class USPAttention_SVG2(nn.Module):
         
         # FlashAttention backend for full attention (when early layers/timesteps need it)
         # This gives us the optimized FlashAttention performance
-        dtype = get_compute_dtype()
-        fa_backend_cls = get_attn_backend(
-            head_size=head_size,
-            dtype=dtype,
-            supported_attention_backends=supported_attention_backends,
+        # NOTE: We directly import FlashAttentionImpl instead of using get_attn_backend
+        # because get_attn_backend would return SVG2 when attention_backend=svg2_sparse_attn
+        from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+            FlashAttentionImpl,
         )
-        self.fa_impl = fa_backend_cls.get_impl_cls()(
+        self.fa_impl = FlashAttentionImpl(
             num_heads=num_heads,
             head_size=head_size,
             causal=causal,
@@ -486,7 +485,7 @@ class USPAttention_SVG2(nn.Module):
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
         self.backend = AttentionBackendEnum.SVG2_SPARSE_ATTN
-        self.dtype = dtype  # Already obtained above
+        self.dtype = get_compute_dtype()
         self.causal = causal
         self.dropout_p = dropout_rate
         
