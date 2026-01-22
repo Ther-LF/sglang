@@ -644,8 +644,6 @@ def identify_dynamic_mask(
     top_p: float = 0.5,
     min_kc_ratio: float = 0.0,
     max_k_clusters_per_q: Optional[int] = None,
-    *,
-    match_sparse_videogen_numerics: bool = True,
 ) -> torch.Tensor:
     """
     Generate dynamic block mask based on centroid similarity.
@@ -668,20 +666,8 @@ def identify_dynamic_mask(
     
     # 1. Compute attention scores: (Q @ K.T) / sqrt(D)
     scale = 1.0 / math.sqrt(D)
-    #
-    # NOTE on numerical parity with Sparse-VideoGen:
-    # Sparse-VideoGen's `identify_dynamic_map()` computes matmul in the incoming dtype
-    # (fp16/bf16 typically), then runs softmax in fp32 and *casts the probabilities back*
-    # to the original dtype before sort/cumsum/top-p selection. That cast can change the
-    # ordering for near-ties at the top-p boundary and lead to a few-bit mask mismatch.
-    #
-    # SGLang's default path computes probabilities in fp32 for better stability.
-    # For exact parity tests, set `match_sparse_videogen_numerics=True`.
-    if match_sparse_videogen_numerics:
-        # [B, H, Kq, D] @ [B, H, Kk, D].T -> [B, H, Kq, Kk] in input dtype
-        scores = torch.matmul(q_centroids, k_centroids.transpose(-2, -1)) * scale
-    else:
-        scores = torch.einsum("bhqd,bhkd->bhqk", q_centroids.float(), k_centroids.float()) * scale
+    # [B, H, Kq, D] @ [B, H, Kk, D].T -> [B, H, Kq, Kk]
+    scores = torch.einsum('bhqd,bhkd->bhqk', q_centroids.float(), k_centroids.float()) * scale
     
     # 2. Weight scores by Key cluster sizes (Importance of Key)
     # Note: SVG original logic weights by K size, not Q*K size
@@ -689,13 +675,10 @@ def identify_dynamic_mask(
     
     # 3. Weighted Softmax per Query (Row-wise)
     # This computes probability distribution of attention for each Query cluster
-    out_dtype = scores.dtype if match_sparse_videogen_numerics else None
-    max_score = torch.max(scores.float(), dim=-1, keepdim=True)[0]
-    exp_scores = torch.exp(scores.float() - max_score)
+    max_score = torch.max(scores, dim=-1, keepdim=True)[0]
+    exp_scores = torch.exp(scores - max_score)
     weighted_exp = k_weights * exp_scores
     weighted_probs = weighted_exp / torch.sum(weighted_exp, dim=-1, keepdim=True).clamp(min=1e-12)
-    if out_dtype is not None:
-        weighted_probs = weighted_probs.to(out_dtype)
     
     # 4. Optional Top-K cap (Optimization for speed)
     if max_k_clusters_per_q is not None:
@@ -1212,7 +1195,7 @@ def svg2_attention_forward(
     if init_k_centroids is not None:
         k_init = init_k_centroids.reshape(B * H, num_k_clusters, D)
     
-    # Step 1: K-Means clustering (local Triton kernels)
+    # Step 1: K-Means clustering
     if enable_profiling:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -1238,7 +1221,7 @@ def svg2_attention_forward(
     k_centroids = k_centroids.reshape(B, H, num_k_clusters, D)
     k_cluster_sizes = k_cluster_sizes.reshape(B, H, num_k_clusters)
     
-    # Step 2: Generate dynamic block mask (local implementation; match SVG numerics)
+    # Step 2: Generate dynamic block mask
     if enable_profiling:
         torch.cuda.synchronize()
         t2 = time.perf_counter()
@@ -1251,7 +1234,6 @@ def svg2_attention_forward(
         top_p=top_p,
         min_kc_ratio=min_kc_ratio,
         max_k_clusters_per_q=max_k_clusters_per_q,
-        match_sparse_videogen_numerics=True,
     )
     
     if enable_profiling:
@@ -1273,7 +1255,7 @@ def svg2_attention_forward(
     
     logger.debug(f"[SVG2] Block Mask: {active_blocks}/{total_blocks} active ({100*block_retention_ratio:.1f}%), sparsity={sparsity*100:.1f}%")
     
-    # Step 3: Permute Q, K, V by cluster labels (local Triton kernels)
+    # Step 3: Permute Q, K, V by cluster labels
     if enable_profiling:
         torch.cuda.synchronize()
         t4 = time.perf_counter()
@@ -1287,21 +1269,17 @@ def svg2_attention_forward(
         t5 = time.perf_counter()
         profile_stats['permute_ms'] = (t5 - t4) * 1000
     
-    # Step 4: Block sparse attention (local Triton split-k)
+    # Step 4: Block sparse attention
     if enable_profiling:
         torch.cuda.synchronize()
         t6 = time.perf_counter()
     
-    # Ensure expected dtype for offset computations inside Triton kernel
-    q_cluster_sizes_i32 = q_cluster_sizes.to(torch.int32)
-    k_cluster_sizes_i32 = k_cluster_sizes.to(torch.int32)
     out_perm = block_sparse_attention(
         q_perm,
         k_perm,
         v_perm,
         block_mask,
-        q_cluster_sizes_i32,
-        k_cluster_sizes_i32,
+        q_cluster_sizes, k_cluster_sizes,
     )
     
     if enable_profiling:
@@ -1309,7 +1287,7 @@ def svg2_attention_forward(
         t7 = time.perf_counter()
         profile_stats['sparse_attn_ms'] = (t7 - t6) * 1000
     
-    # Step 5: Inverse permutation (local Triton kernel)
+    # Step 5: Inverse permutation
     if enable_profiling:
         torch.cuda.synchronize()
         t8 = time.perf_counter()
@@ -1342,12 +1320,9 @@ class SVG2SparseAttentionMetadata(AttentionMetadata):
     num_q_clusters: int = 64
     num_k_clusters: int = 300
     top_p: float = 0.9
-    # KMeans iteration schedule (match Sparse-VideoGen SAP defaults)
     kmeans_iter_init: int = 5
     kmeans_iter_step: int = 1
-    # Back-compat alias; if provided by older callers, it is treated as the "step" iters.
     kmeans_iters: int = 1
-    # Minimum ratio of key clusters to keep (Sparse-VideoGen uses 0.10 in released scripts)
     min_kc_ratio: float = 0.0
     # Optional cap: for each query cluster, keep at most this many key clusters.
     # This is typically the most important knob for latency.
@@ -1566,7 +1541,6 @@ class SVG2SparseAttentionImpl(AttentionImpl):
                self.q_centroids.shape[1] == query.shape[2]: # num_heads
                 init_q = self.q_centroids
                 init_k = self.k_centroids
-                # Match Sparse-VideoGen SAP: do a small refinement each diffusion step.
                 current_kmeans_iters = kmeans_iter_step
                 centroid_reuse = True
         
